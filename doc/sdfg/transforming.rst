@@ -1,5 +1,7 @@
-Transforming SDFGs
-==================
+.. _transforming:
+
+SDFG Transformation Internals
+=============================
 
 Once created, stateful dataflow multigraphs can be transformed for performance, offloading to different architectures, 
 and reducing elements for simplification and further transformations.
