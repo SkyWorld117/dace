@@ -175,6 +175,11 @@ class CUDACodeGen(TargetCodeGenerator):
                                       CUDACodeGen,
                                       'CUDA',
                                       target_type=target_type)
+        # Top-level program name: every kernel symbol below is qualified with
+        # it, so two compiled programs whose maps share structural labels
+        # (e.g. dace-fortran per-direction captures of the same loop) cannot
+        # collide on __global__/stub/runkernel symbols across shared objects.
+        self._program_name = sdfg.name
 
         # TODO: Below implementation is a bit wasteful to iterate over all nodes.
         # Better: Do this in a dedicated pass and do not e.g. recurse further into
@@ -1702,7 +1707,7 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
                     create_grid_barrier = True
 
         self.create_grid_barrier = create_grid_barrier
-        kernel_name = '%s_%d_%d_%d' % (scope_entry.map.label, cfg.cfg_id, state.block_id, state.node_id(scope_entry))
+        kernel_name = '%s_%s_%d_%d_%d' % (self._program_name, scope_entry.map.label, cfg.cfg_id, state.block_id, state.node_id(scope_entry))
 
         # Comprehend grid/block dimensions from scopes
         grid_dims, block_dims, tbmap, dtbmap, _ = self.get_kernel_dimensions(dfg_scope)
