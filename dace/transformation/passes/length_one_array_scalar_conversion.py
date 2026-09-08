@@ -236,6 +236,11 @@ def descriptor_is_written(sdfg: SDFG, name: str) -> bool:
     return False
 
 
+#: Label prefixes of the states staging creates; ``add_state`` uniquifies, so match by prefix.
+#: Consumers (the dace-fortran bridge) key their own bookkeeping on these labels.
+_STAGING_STATE_PREFIXES = ('stage_copyin', 'stage_copyout')
+
+
 def _copyin_state(sdfg: SDFG) -> SDFGState:
     """A new start state to hold copy-IN edges (prepended before the current start)."""
     return sdfg.add_state_before(sdfg.start_state, 'stage_copyin', is_start_block=True)
