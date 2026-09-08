@@ -35,6 +35,7 @@ The HLFIR Fortran frontend uses ``ConvertLengthOneArraysToScalars`` as a post-ge
 ``Array`` needs a 1-element numpy buffer.
 """
 import ast
+import re
 import itertools
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -218,8 +219,34 @@ def repoint_memlet_to_element(edge: 'dace.sdfg.graph.MultiConnectorEdge', rename
         mem.other_subset = subsets.Range.from_string('0')
 
 
-def descriptor_is_read(sdfg: SDFG, name: str) -> bool:
-    """True if ``name`` is read anywhere in ``sdfg`` (some AccessNode of it has an out-edge)."""
+#: A bare identifier, not preceded by a word character or ``.`` -- what counts as a reference in
+#: control-flow code slots (the same anchoring ``rewrite_refs`` uses for its rewrites).
+_IDENT_RE = re.compile(r'(?<![\w.])([A-Za-z_]\w*)')
+
+
+def _control_flow_reads(sdfg: SDFG) -> Set[str]:
+    """Descriptor names ``sdfg`` reads from control flow: gate conditions, loop bounds, assignment RHS.
+
+    Staging repoints those references to the scalar, so they are reads for the copy-in decision even
+    though no AccessNode exists -- without this a gate scalar is declared, read and never written,
+    and downstream dead-code elimination dangles the references (FaCe's dace-fortran bridge stages
+    such scalars).
+    """
+    names: Set[str] = set()
+
+    def collect(src: str) -> str:
+        names.update(_IDENT_RE.findall(src))
+        return src
+
+    rewrite_code_slots(sdfg, collect)
+    return names
+
+
+def descriptor_is_read(sdfg: SDFG, name: str, cf_reads: Optional[Set[str]] = None) -> bool:
+    """True if ``name`` is read anywhere in ``sdfg``: through dataflow (some AccessNode of it has an
+    out-edge) or through control flow (a gate condition, loop bound, or assignment RHS)."""
+    if cf_reads is not None and name in cf_reads:
+        return True
     for state in sdfg.all_states():
         for node in state.nodes():
             if isinstance(node, nodes.AccessNode) and node.data == name and state.out_degree(node) > 0:
@@ -239,6 +266,23 @@ def descriptor_is_written(sdfg: SDFG, name: str) -> bool:
 #: Label prefixes of the states staging creates; ``add_state`` uniquifies, so match by prefix.
 #: Consumers (the dace-fortran bridge) key their own bookkeeping on these labels.
 _STAGING_STATE_PREFIXES = ('stage_copyin', 'stage_copyout')
+
+
+def _already_staged(sdfg: SDFG, name: str) -> bool:
+    """True if every reference to ``name`` sits in a staging state a previous run created.
+
+    Staging keeps the signature array, so a re-run would find it eligible again and chain a second
+    redundant copy hop onto the first. Detecting that here is what makes the pass idempotent.
+    """
+    seen = False
+    for state in sdfg.all_states():
+        in_staging = state.label.startswith(_STAGING_STATE_PREFIXES)
+        for node in state.nodes():
+            if isinstance(node, nodes.AccessNode) and node.data == name:
+                if not in_staging:
+                    return False
+                seen = True
+    return seen
 
 
 def _copyin_state(sdfg: SDFG) -> SDFGState:
@@ -425,6 +469,7 @@ class ConvertLengthOneArraysToScalars(ppl.Pass):
         :returns: Names of the descriptors that are now scalar-referenced in the body.
         """
         blocked = self._blocked_sources(sdfg) | self._blocked_by_unscalarizable_neighbors(sdfg)
+        cf_reads = _control_flow_reads(sdfg)
         # rename[old] = the name the body should reference after the rewrite (== old for a transient
         # scalarized in place; a fresh scalar name for a staged non-transient). staged carries the
         # kept signature array plus its read/write direction so copy-in/out can be wired afterwards.
@@ -445,8 +490,13 @@ class ConvertLengthOneArraysToScalars(ppl.Pass):
                                 find_new_name=False)
                 rename[arr_name] = arr_name
             elif stage_nontransients:
-                is_read = descriptor_is_read(sdfg, arr_name)
+                is_read = descriptor_is_read(sdfg, arr_name, cf_reads)
                 is_written = descriptor_is_written(sdfg, arr_name)
+                # An unreferenced signature array has nothing to stage, and one already staged would
+                # only gain a second copy hop -- skipping both keeps re-application a true no-op
+                # (the dace-fortran bridge runs this pass twice: at capture and in ``optimize``).
+                if not (is_read or is_written) or _already_staged(sdfg, arr_name):
+                    continue
                 # Fresh name every time (find_new_name): a re-run over an already-staged array never
                 # collides with the scalar an earlier run created.
                 scal_name, _ = sdfg.add_scalar(f'scal_{arr_name}',
