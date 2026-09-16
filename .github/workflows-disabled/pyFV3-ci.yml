@@ -39,7 +39,7 @@ jobs:
          cache-dependency-glob: pyproject.toml
      - name: Set matrix data
        id: set-matrix
-       run: echo "matrix={\"include\":$(jq -c . < .github/workflows/pyFV3-regression-matrix.json)}" >> $GITHUB_OUTPUT
+       run: echo "matrix={\"include\":$(jq -c . < .github/workflows-disabled/pyFV3-regression-matrix.json)}" >> $GITHUB_OUTPUT
 
   build_and_validate_pyFV3:
     runs-on: ubuntu-latest
