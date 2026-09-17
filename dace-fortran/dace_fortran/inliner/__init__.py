@@ -1,0 +1,10 @@
+# Copyright 2025-2026 ETH Zurich and the dace-fortran authors. All rights reserved.
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Vendored fparser AST desugaring / inlining package.
+
+Faithful copy of upstream DaCe Fortran frontend's ``ast_desugaring`` package
+plus a minimal ``ast_utils`` shim, trimmed to what the source-text single-TU
+inliner (:mod:`dace_fortran.fparser_inliner`) needs.  Kept import-compatible
+with upstream (``from .. import ast_utils``).  Public API is in
+:mod:`dace_fortran.fparser_inliner` (``inline_to_single_tu``/``inline_to_ast``).
+"""

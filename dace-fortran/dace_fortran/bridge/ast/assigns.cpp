@@ -1,0 +1,1947 @@
+// Translation-unit headers.  ``ast_helpers.h`` carries the cross-TU
+// API + thread-local state shared with the other ``ast/*.cpp`` files.
+#include <functional>
+#include <iomanip>
+#include <map>
+#include <set>
+#include <sstream>
+#include <string>
+#include <variant>
+#include <vector>
+
+#include "bridge/ast/ast_helpers.h"
+#include "bridge/ast/ast_internal.h"
+#include "flang/Optimizer/Dialect/FIROps.h"
+#include "flang/Optimizer/HLFIR/HLFIROps.h"
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+
+namespace hlfir_bridge {
+
+//
+// Per-shape assign builders + small type / value helpers.  Owns:
+//   * buildIndexExpr body (continuation from expressions.cpp's forward
+//     declaration).
+//   * buildAssignNode / buildCopyNode / buildMemsetNode /
+//     buildLibCallNode  --  one ASTNode per Fortran assignment shape.
+//   * buildSectionScalarAssign / buildSectionReduceAssign  --
+//     loop-synthesis for arr(lo:hi) = scalar and section-reduce.
+//   * Type / value helpers: peelWrappers, isArrayRef,
+//     isConstantZero, traceLB, asSectionDesignate.
+//
+// This file is included verbatim from extract_ast.cpp via
+// #include "bridge/ast/assigns.cpp" and shares that translation
+// unit's namespace, includes, and file-static state.  It MUST NOT be
+// added to the build's compile list  --  CMakeLists.txt deliberately omits
+// it.  The split is purely for readability: the AST builder used to
+// be a single 2800-line file.
+std::string buildIndexExpr(mlir::Value v, int d) {
+  if (d > limits::kBuildIndexExprDepth || !v) return "?";
+
+  // Block args (fir.do_loop induction, hlfir.elemental iter) have no
+  // defining op  --  resolve via indexStack() first so inlined elemental
+  // bodies that use the block arg directly as a designate index don't
+  // fall through to "?".
+  if (!v.getDefiningOp()) {
+    auto resolved = resolveIndex(v);
+    if (!resolved.empty()) return resolved;
+    return "?";
+  }
+  auto* def = v.getDefiningOp();
+
+  // fir.convert is transparent.
+  if (auto conv = mlir::dyn_cast<fir::ConvertOp>(def)) return buildIndexExpr(conv.getValue(), d + 1);
+
+  // Integer width casts (``arith.extsi`` / ``extui`` / ``trunci``) are
+  // transparent in an index context -- they appear when Flang extends
+  // an ``i32`` loop counter to ``i64`` for subscripting (``arr(i)``
+  // with ``i`` declared ``integer(4)``) and emits the cast as an
+  // ``arith.*`` op rather than ``fir.convert``.  Without this pass-
+  // through the index bottoms out at ``?``.  (``buildExpr`` already
+  // treats these as transparent; mirror it here.)
+  {
+    auto cn = def->getName().getStringRef();
+    if ((cn == "arith.extsi" || cn == "arith.extui" || cn == "arith.trunci") && def->getNumOperands() == 1)
+      return buildIndexExpr(def->getOperand(0), d + 1);
+  }
+
+  // ``hlfir.no_reassoc`` is Flang's reassociation-barrier wrapper around a
+  // parenthesised operand; it wraps the summands of an arithmetic subscript
+  // (``a(i + 1)`` lowers to ``addi(no_reassoc(load i), 1)``).  Transparent in
+  // an index -- recurse into its single operand, else the whole subscript
+  // strands at ``?`` (matches the ``buildExpr`` handler in expressions.cpp).
+  if (def->getName().getStringRef() == "hlfir.no_reassoc" && def->getNumOperands() == 1)
+    return buildIndexExpr(def->getOperand(0), d + 1);
+
+  // ``fir.unboxchar`` length result (``len(what) - 1`` LEN_TRIM scan bound): character-domain bookkeeping the
+  // numerical-equivalence contract does not model (hlfir-strip-character-runtime) -- benign constant, mirrors the
+  // buildExpr handler.
+  if (auto uc = mlir::dyn_cast<fir::UnboxCharOp>(def))
+    if (mlir::cast<mlir::OpResult>(v).getResultNumber() == 1) return "1";
+
+  // ``hlfir.apply %elem, %i`` used as a designate index (e.g. the
+  // gather elemental ``cols(arg2)`` produced for noncontiguous slice
+  // arguments).  Inline the referenced elemental's body and recurse
+  // on its yielded value so the index renders as ``cols[i]`` rather
+  // than the bare iter name.  Mirrors the ``hlfir.apply`` handler in
+  // ``buildExpr`` (expressions.cpp).
+  if (auto apply = mlir::dyn_cast<hlfir::ApplyOp>(def)) {
+    auto src = apply.getExpr();
+    if (auto* sd = src.getDefiningOp())
+      if (auto inner_elem = mlir::dyn_cast<hlfir::ElementalOp>(sd)) {
+        auto& ireg = inner_elem.getRegion();
+        if (!ireg.empty()) {
+          auto& iblock = ireg.front();
+          auto apply_idxs = apply.getIndices();
+          unsigned pushed = 0;
+          for (unsigned i = 0; i < iblock.getNumArguments() && i < apply_idxs.size(); ++i) {
+            auto name = resolveIndex(apply_idxs[i]);
+            indexStack().emplace_back(iblock.getArgument(i), name);
+            ++pushed;
+          }
+          std::string result = "?";
+          for (auto& iop : iblock)
+            if (auto y = mlir::dyn_cast<hlfir::YieldElementOp>(iop)) {
+              result = buildIndexExpr(y.getElementValue(), d + 1);
+              break;
+            }
+          for (unsigned i = 0; i < pushed; ++i) indexStack().pop_back();
+          return result;
+        }
+      }
+  }
+
+  // A loaded scalar  --  either a named variable (loop iter) or an indirect
+  // access via hlfir.designate on another array.
+  if (auto ld = mlir::dyn_cast<fir::LoadOp>(def)) {
+    auto mem = ld.getMemref();
+    if (auto* md = mem.getDefiningOp()) {
+      if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(md)) {
+        // Struct field load used as an index (``arr(g % idx)``):
+        // the designate has a component attribute and no
+        // subscripts.  Resolve to the flattened scalar name
+        // (``g_idx``) via the component-aware ``traceToDecl`` walk
+        // and mint an entry-time POSITION SYMBOL
+        // (``__sym_g_idx_1``) -- same one-shot symbol-init shape
+        // ``internPosSymbol`` uses for constant-indexed array
+        // element reads.  The Python emitter stages it as
+        // ``__sym_g_idx_1 = g_idx[0]`` on an interstate edge at
+        // SDFG entry; downstream memlet subsets pick up the
+        // symbol directly.  Without this promotion, the raw
+        // ``g_idx`` scalar transient leaks into the memlet
+        // subset and DaCe's parser raises
+        // ``unresolved free symbol(s) in SDFG: ['g_idx']``.
+        if (dg.getComponentAttr() && dg.getIndices().empty()) {
+          auto flatName = traceToDecl(dg.getResult());
+          if (flatName.empty()) return "?";
+          return internPosSymbol(flatName, 1);
+        }
+        auto arrName = resolveIndex(dg.getMemref());
+        if (arrName.empty()) arrName = traceToDecl(dg.getMemref());
+        if (arrName.empty()) return "?";
+        // Constant-indexed array element used as an index / bound
+        // (Fortran ``pos(1):pos(2)`` / ``a(idx(1), j)`` / ...).
+        //
+        // Two lowerings are available:
+        //
+        //   (a) ``internPosSymbol``  --  mint a one-shot SDFG
+        //       symbol ``__sym_<arr>_<n>`` and prepend a
+        //       ``kind="symbol_init"`` AST node that the
+        //       Python emitter stages as an interstate-edge
+        //       load ``__sym_<arr>_<n> = <arr>[n-1]`` at
+        //       SDFG entry.  Every memlet that uses the
+        //       symbol is then a closed-form expression DaCe
+        //       can simplify, instead of a data reference it
+        //       can't represent in subset form.
+        //
+        //   (b) Fall through to the ``arr[idx]`` form below
+        //        --  the per-occurrence indirect-symbol
+        //       machinery (``collect_indirect`` /
+        //       ``indirect_to_dace`` in
+        //       ``builder/access.py``) mints a fresh
+        //       ``<arr>_at<gid>`` symbol at the read site.
+        //
+        // (a) is cheaper (one symbol shared across uses) but
+        // ONLY safe when the array's contents don't change
+        // after SDFG entry  --  read-only ``parameter``
+        // constants and ``intent(in)`` dummies fit; arrays
+        // the kernel writes do NOT.  An entry-time read of
+        // a not-yet-initialised local captures uninitialised
+        // memory, and every subsequent use of the symbol
+        // sees garbage.  long_tasklet_test exercises this:
+        // ``ind%indices(:) = 1; ... arr(ind%indices(1))``  --
+        // (a) loads ``ind_indices[0]`` BEFORE the body's
+        // initialiser runs.
+        //
+        // Gate: if the source declare is the LHS of any
+        // ``hlfir.assign`` in the enclosing function (walked
+        // through chained ``hlfir.designate`` ops on the
+        // LHS), treat it as mutable and fall through to (b).
+        auto idxOps = dg.getIndices();
+        bool allConstScalar = !idxOps.empty();
+        std::vector<int64_t> consts;
+        for (auto idx : idxOps) {
+          auto c = traceConstInt(idx);
+          if (!c) {
+            allConstScalar = false;
+            break;
+          }
+          consts.push_back(*c);
+        }
+        if (allConstScalar && consts.size() == 1) {
+          bool isMutable = false;
+          if (auto srcDecl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(dg.getMemref().getDefiningOp())) {
+            if (auto func = srcDecl->getParentOfType<mlir::func::FuncOp>()) {
+              func.walk([&](hlfir::AssignOp aop) {
+                auto lhs = aop.getLhs();
+                for (int hop = 0; hop < 8 && lhs; ++hop) {
+                  if (lhs == srcDecl.getResult(0) || lhs == srcDecl.getResult(1)) {
+                    isMutable = true;
+                    return;
+                  }
+                  auto* ld = lhs.getDefiningOp();
+                  if (!ld) break;
+                  if (auto innerDg = mlir::dyn_cast<hlfir::DesignateOp>(ld)) {
+                    lhs = innerDg.getMemref();
+                    continue;
+                  }
+                  break;
+                }
+              });
+            }
+          }
+          if (!isMutable) return internPosSymbol(arrName, consts[0]);
+          // Mutable source  --  fall through.  The matching
+          // Python-side fix lives in
+          // ``builder/access.py::build_memlet_index``: the
+          // bare-iter-name fallback now defaults to the
+          // bridge-supplied ``index_exprs[dim]`` instead
+          // of ``index_vars[dim]``, so the ``<arr>[idx]``
+          // form rendered below survives all the way to
+          // the memlet without being clobbered by
+          // ``resolveIndex``'s whole-array-name fallback.
+        }
+        // Multi-dim constant-indexed reads (``pos(1, 2)``) are not
+        // yet folded to a symbol; the legacy ``pos[0, 1]`` form
+        // below still applies.
+        // Non-constant index  --  render as a Fortran 1-based
+        // subscript ``arr[idx, ...]``.  The Python emitter
+        // converts this to DaCe 0-based form
+        // (``arr[(idx) - offset_arr_d0, ...]``) at consumption
+        // time  --  loop bounds via ``_fortran_subs_to_dace``,
+        // memlets via ``indirect_to_dace``  --  keeping the bridge
+        // output uniform regardless of which downstream context
+        // ultimately consumes it.
+        // Rank-reducing section parent: ``mill(1, offset+1:blk)`` produces a
+        // 1-D view, then indexed by ``[k]``.  The innermost designate's own
+        // indices (``[k]``) don't describe the ROOT array's full subscript --
+        // the fixed component dim (``1``) and the slice lower-bound rebase
+        // live on the parent SECTION designate.  Compose the whole chain with
+        // the same ``expandDesignateChain`` the elemental path uses (it yields
+        // one (var, expr) per underlying-array dim, folding parent scalar dims
+        // + slice rebases in) so a 2-D gather index
+        // ``eigts1(mill(1, off+1:blk), na)`` emits ``mill[1, off+k]`` (a single
+        // element) instead of the rank-deficient ``mill[k]`` -- which on a 2-D
+        // array is a RANGE, illegal on the interstate edge that hosts the
+        // minted indirect symbol.  Only fires when the chain exposes MORE dims
+        // than the innermost carries; a plain element / AoR access keeps the
+        // existing innermost render below (byte-identical).
+        {
+          auto [chainArr, chainDims] = expandDesignateChain(dg);
+          if (!chainArr.empty() && chainDims.size() > dg.getIndices().size()) {
+            std::string cs = chainArr + "[";
+            bool cfirst = true;
+            for (auto& de : chainDims) {
+              if (!cfirst) cs += ",";
+              cs += de.expr.empty() ? "?" : de.expr;
+              cfirst = false;
+            }
+            cs += "]";
+            return cs;
+          }
+        }
+        std::string s = arrName + "[";
+        bool first = true;
+        unsigned di = 0;
+        for (auto idx : dg.getIndices()) {
+          if (!first) s += ",";
+          s += buildDesignateIndexExpr(dg, di, idx, d + 1);
+          first = false;
+          ++di;
+        }
+        s += "]";
+        return s;
+      }
+    }
+    auto n = traceToDecl(mem);
+    if (!n.empty()) return n;
+    // Last resort: maybe the load memref is the elemental's block arg
+    // indirectly (unlikely, but guard).
+    return "?";
+  }
+
+  // Inside an elemental body, an index value IS a tracked block arg.
+  auto resolved = resolveIndex(v);
+  if (!resolved.empty()) return resolved;
+
+  // Constant integer.
+  if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(def))
+    if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue())) return std::to_string(i.getInt());
+
+  // ``fir.box_dims %arr, %dim``  --  runtime descriptor read on an
+  // allocatable / pointer array.  Flang emits this for ``arr(:)``
+  // section bounds: each ``:`` triplet's ``lo`` is ``box_dims#0``
+  // (lower bound) and the implicit ``hi`` derives from
+  // ``box_dims#0 + box_dims#1 - 1`` (extent).  Map back onto the
+  // bridge's per-array shape / offset symbols so a whole-array
+  // section ``arr(:)`` resolves to ``offset_<arr>_d<K> :
+  // (offset_<arr>_d<K> + <arr>_d<K> - 1)``.
+  //
+  // Only fires for arrays without a visible ``fir.allocmem`` in the
+  // module  --  local allocatables (``allocate(x(n))``) have one, and
+  // ``extract_vars`` resolves their extent to the real Fortran scalar
+  // (``n``) rather than minting an ``<arr>_d<K>`` symbol.  Emitting
+  // the synth symbol here for those would surface a missing-symbol
+  // KeyError at SDFG build time.  Top-level pointer / allocatable
+  // companions produced by ``hlfir-flatten-structs`` (alloc happens
+  // outside this scope) have no allocmem and DO carry the ``_d<K>``
+  // symbol via ``extract_vars``'s assumed-shape branch.
+  if (def->getName().getStringRef() == "fir.box_dims" && def->getNumOperands() >= 2) {
+    auto resIdx = mlir::cast<mlir::OpResult>(v).getResultNumber();
+    if (resIdx == 2) return "1";  // stride  --  bridge requires contiguous
+    auto dimC = traceConstInt(def->getOperand(1));
+    // Walk operand 0 back to a declare so we can name the array.
+    mlir::Value arrayVal = def->getOperand(0);
+    for (int hop = 0; hop < limits::kTraceToDeclMax && arrayVal; ++hop) {
+      auto* adef = arrayVal.getDefiningOp();
+      if (!adef) break;
+      if (auto cv = mlir::dyn_cast<fir::ConvertOp>(adef)) {
+        arrayVal = cv.getValue();
+        continue;
+      }
+      if (auto ld = mlir::dyn_cast<fir::LoadOp>(adef)) {
+        arrayVal = ld.getMemref();
+        continue;
+      }
+      break;
+    }
+    auto arrName = traceToDecl(arrayVal);
+    // ``fir.box_dims`` reads the box (#1) result of an
+    // ``hlfir.declare``; ``traceToDecl`` keys on the addr result
+    // and comes back empty for an assumed-shape / boxed dummy
+    // (``a(10:)`` -> ``fir.shift`` + box).  Recover the name from
+    // the declare's mangled uniq_name so the lower bound resolves
+    // to ``offset_<arr>_d<dim>`` instead of leaking ``?`` into the
+    // do-loop upper-bound expression (E10).
+    if (arrName.empty()) {
+      if (auto* adef = arrayVal.getDefiningOp())
+        if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(adef)) arrName = extractName(decl.getUniqName().str());
+    }
+    if (dimC && !arrName.empty()) {
+      // Suppress when an allocmem in the module carries this
+      // declare's expected name  --  that path keeps the legacy
+      // bounds-fail fallback (``buildCopyNode`` whole-array copy).
+      bool hasAllocmem = false;
+      int allocmemCount = 0;
+      fir::AllocMemOp allocOp;
+      if (auto* adef = arrayVal.getDefiningOp()) {
+        if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(adef)) {
+          std::string allocName = decl.getUniqName().str() + ".alloc";
+          if (auto mod = decl->getParentOfType<mlir::ModuleOp>()) {
+            mod.walk([&](fir::AllocMemOp a) {
+              if (auto un = a.getUniqName())
+                if (un->str() == allocName) {
+                  ++allocmemCount;
+                  if (!hasAllocmem) {
+                    hasAllocmem = true;
+                    allocOp = a;
+                  }
+                }
+            });
+          }
+        }
+      }
+      // Conditional / multi-site ALLOCATE of the SAME allocatable
+      // (``IF (c) ALLOCATE(a(n)) ELSE ALLOCATE(a(m))``) keeps ONE buffer
+      // whose extent is branch-dependent; flang emits one ``fir.allocmem``
+      // per branch, all sharing the ``<decl>.alloc`` uniq_name.  Picking
+      // any single site's extent below (the ``mod.walk`` lands on the
+      // first / then-branch ``n``) would make ``size(a)`` / a section
+      // bound mis-size the loop on the OTHER branch and over-run the
+      // buffer (``corrupted size vs. prev_size`` heap abort).  Resolve to
+      // the bridge's MERGED descriptor symbol instead: extract_vars
+      // assigns ``<arr>_d<dim> = n`` / ``= m`` per branch and they join at
+      // the IF, so it carries the correct runtime extent.  (A genuine
+      // sequential re-ALLOCATE gets a fresh versioned buffer name upstream,
+      // so its allocmem ops do NOT share a uniq_name and never land here.)
+      if (allocmemCount > 1) {
+        if (resIdx == 0) return "1";  // default-shape ALLOCATE -> lb 1
+        if (resIdx == 1) return arrName + "_d" + std::to_string(*dimC);
+      }
+      // Local allocatable (``ALLOCATE(arr(e0, e1, ...))``) used in a
+      // SECTION-bound context (``arr(:, ii)``).  ``box_dims`` reads the
+      // runtime descriptor; resolve it from the ALLOCATE itself rather
+      // than leaking ``?``:
+      //   * lower bound (resIdx 0)  --  Fortran default-shape ALLOCATE
+      //     gives lbound 1 (``ALLOCATE(arr(0:n))`` lo:hi form is rare
+      //     and would carry an explicit shift; not handled here).
+      //   * extent (resIdx 1)  --  the ALLOCATE's per-dim extent
+      //     operand, rendered through ``buildIndexExpr`` (e.g. ``nkb``).
+      // Without this the QE deexx / temppsic / aux section bounds
+      // (``deexx(:, ii)`` with ``deexx`` a local allocatable) bottomed
+      // out at ``?`` in the memlet subset.
+      if (hasAllocmem && allocOp) {
+        if (resIdx == 0) return "1";
+        if (resIdx == 1) {
+          auto shp = allocOp.getShape();
+          auto const udim = static_cast<unsigned>(*dimC);
+          if (udim < shp.size()) {
+            auto te = traceExtentExpr(shp[udim]);
+            if (!te.empty() && te != "?") return te;
+            auto s = buildIndexExpr(shp[udim], d + 1);
+            if (!s.empty() && s != "?") return s;
+          }
+        }
+      }
+      if (!hasAllocmem) {
+        // Before falling back to the synthesised ``<arr>_d<dim>``
+        // symbol, try the same shape-operand walk the
+        // ``buildExpr`` box_dims handler does in expressions.cpp.
+        // For a caller declare ``arr(n)`` whose body carries
+        // ``fir.shape %max(n, 0)``, this resolves the loop bound
+        // directly to ``n`` instead of leaking ``arr_d0`` -- the
+        // caller already passes ``n`` and wouldn't know to bind
+        // a synthetic shape symbol.
+        if (resIdx == 1) {
+          mlir::Value shapeVal;
+          if (auto* adef = arrayVal.getDefiningOp()) {
+            if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(adef)) {
+              shapeVal = decl.getShape();
+              if (!shapeVal) {
+                if (auto outer = asAssumedShapeAlias(decl)) shapeVal = outer.getShape();
+              }
+            }
+          }
+          if (shapeVal) {
+            auto const udim = static_cast<unsigned>(*dimC);
+            if (auto sh = mlir::dyn_cast<fir::ShapeOp>(shapeVal.getDefiningOp())) {
+              if (udim < sh.getExtents().size()) {
+                auto te = traceExtentExpr(sh.getExtents()[udim]);
+                if (!te.empty() && te != "?") return te;
+                auto s = buildIndexExpr(sh.getExtents()[udim], d + 1);
+                if (!s.empty() && s != "?") return s;
+              }
+            }
+            if (auto ss = mlir::dyn_cast<fir::ShapeShiftOp>(shapeVal.getDefiningOp())) {
+              auto ops = ss->getOperands();
+              unsigned const extIdx = (2 * udim) + 1;
+              if (extIdx < ops.size()) {
+                auto te = traceExtentExpr(ops[extIdx]);
+                if (!te.empty() && te != "?") return te;
+                auto s = buildIndexExpr(ops[extIdx], d + 1);
+                if (!s.empty() && s != "?") return s;
+              }
+            }
+          }
+        }
+        std::string const suffix = "_d" + std::to_string(*dimC);
+        if (resIdx == 0) return "offset_" + arrName + suffix;
+        if (resIdx == 1) return arrName + suffix;
+      }
+    }
+  }
+
+  // Integer arithmetic used inside index expressions  --  Flang lowers
+  // ``arr(..., nlev-1, ...)`` via ``arith.subi %nlev, %c1``, ``nlev+1``
+  // via ``arith.addi``, etc.  Render parenthesised so downstream
+  // ``build_memlet_index`` takes the closed-form expression branch.
+  auto nm = def->getName().getStringRef();
+  static const std::map<llvm::StringRef, std::string> int_bin = {
+      {"arith.addi", " + "},
+      {"arith.subi", " - "},
+      {"arith.muli", " * "},
+      {"arith.divsi", " // "},
+      {"arith.divui", " // "},
+      // ``MOD(i, k)`` in an index expression (``arr(mod(i,2)+1)``)
+      // lowers to ``arith.remsi`` / ``arith.remui``.  Render as Python
+      // ``%`` -- sympy maps it to ``Mod``, which the memlet-subset
+      // engine accepts.  Fortran ``MOD`` truncates toward zero and
+      // Python ``%`` floors; they agree for non-negative operands,
+      // which every valid array index is (index >= lbound >= 1, and
+      // ``mod(i,k)+1`` only produces a valid subscript when ``i`` is
+      // non-negative).
+      {"arith.remsi", " % "},
+      {"arith.remui", " % "},
+  };
+  if (auto it = int_bin.find(nm); it != int_bin.end() && def->getNumOperands() == 2) {
+    return "(" + buildIndexExpr(def->getOperand(0), d + 1) + it->second + buildIndexExpr(def->getOperand(1), d + 1) +
+           ")";
+  }
+
+  // ``MAX`` / ``MIN`` in a Fortran index / loop bound expression
+  // (``do jk = MAX(3, nrdmax-2), nlev-4``).  Flang's HLFIR lowers
+  // these to ``arith.maxsi`` / ``arith.minsi`` (signed integer) and
+  // their unsigned twins.  Render as ``max(a, b)`` / ``min(a, b)``
+  // -- the same form ``buildExpr`` uses, accepted by both interstate
+  // edge assignments (sympy maps to ``Max`` / ``Min``) and the C++
+  // codegen.
+  static const std::map<llvm::StringRef, std::string> idx_minmax = {
+      {"arith.maxsi", "max"},
+      {"arith.maxui", "max"},
+      {"arith.minsi", "min"},
+      {"arith.minui", "min"},
+  };
+  if (auto it = idx_minmax.find(nm); it != idx_minmax.end() && def->getNumOperands() == 2) {
+    return it->second + "(" + buildIndexExpr(def->getOperand(0), d + 1) + ", " +
+           buildIndexExpr(def->getOperand(1), d + 1) + ")";
+  }
+
+  // Older flang lowerings (and integer MAX / MIN on some kinds) emit
+  // the cmp+select idiom rather than ``arith.maxsi``:
+  //
+  //   %cmp = arith.cmpi sgt, %a, %b
+  //   %r   = arith.select %cmp, %a, %b   ; MAX(a, b)
+  //
+  // The semantic mapping depends on BOTH the predicate AND which
+  // operand of the comparison is selected on the true side -- flang
+  // sometimes canonicalises ``cmpi sgt %a %b ... select %cmp %a %b``
+  // into ``cmpi slt %b %a ... select %cmp %a %b`` (same MAX semantics
+  // but the predicate flipped).  Render directly on the select's
+  // true / false values so the polarity is correct regardless of
+  // canonicalisation:
+  //   pred lt + (true=lhs, false=rhs) -> ``min(lhs, rhs)``
+  //   pred lt + (true=rhs, false=lhs) -> ``max(lhs, rhs)``
+  //   pred gt + (true=lhs, false=rhs) -> ``max(lhs, rhs)``
+  //   pred gt + (true=rhs, false=lhs) -> ``min(lhs, rhs)``
+  if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(def)) {
+    auto* cdef = sel.getCondition().getDefiningOp();
+    if (auto cmp = mlir::dyn_cast_or_null<mlir::arith::CmpIOp>(cdef)) {
+      using P = mlir::arith::CmpIPredicate;
+      auto pred = cmp.getPredicate();
+      // Strict and inclusive variants collapse to the same
+      // min/max semantics (the equal case selects either side
+      // -- both equal, so the choice is irrelevant).
+      bool const is_lt = (pred == P::slt || pred == P::ult || pred == P::sle || pred == P::ule);
+      bool const is_gt = (pred == P::sgt || pred == P::ugt || pred == P::sge || pred == P::uge);
+      if (is_lt || is_gt) {
+        bool const true_is_lhs = (cmp.getLhs() == sel.getTrueValue());
+        bool const true_is_rhs = (cmp.getRhs() == sel.getTrueValue());
+        const char* fn = nullptr;
+        // (lt, true=lhs) and (gt, true=rhs) both pick the smaller -> min;
+        // (lt, true=rhs) and (gt, true=lhs) both pick the larger  -> max.
+        if ((is_lt && true_is_lhs) || (is_gt && true_is_rhs))
+          fn = "min";
+        else if ((is_lt && true_is_rhs) || (is_gt && true_is_lhs))
+          fn = "max";
+        if (fn) {
+          return std::string(fn) + "(" + buildIndexExpr(sel.getTrueValue(), d + 1) + ", " +
+                 buildIndexExpr(sel.getFalseValue(), d + 1) + ")";
+        }
+      }
+      // LBOUND/UBOUND empty-array clamp: flang lowers
+      // ``LBOUND(a,d)`` (and the lb term of ``UBOUND``) on a
+      // boxed assumed-shape array as
+      //   %c = arith.cmpi eq, <box_extent>, 0
+      //   %r = arith.select %c, 1, <declared_lb>
+      // (Fortran: LBOUND of a zero-size array is 1).  For a loop
+      // bound / index the meaningful case is the non-empty array
+      // -> the declared bound (the false branch); a zero-size
+      // array makes the loop empty anyway so the value is
+      // irrelevant.  Resolve to the real bound instead of
+      // leaking the ``?`` sentinel into the expression (E10).
+      if ((pred == P::eq || pred == P::ne)) {
+        auto isConst = [](mlir::Value x, int64_t want) {
+          auto c = traceConstInt(x);
+          return c && *c == want;
+        };
+        bool const condIsZeroExtent = isConst(cmp.getRhs(), 0) || isConst(cmp.getLhs(), 0);
+        mlir::Value const t = sel.getTrueValue();
+        mlir::Value const f = sel.getFalseValue();
+        if (condIsZeroExtent && pred == P::eq && isConst(t, 1))
+          return buildIndexExpr(f, d + 1);  // non-empty: real bound
+        if (condIsZeroExtent && pred == P::ne && isConst(f, 1)) return buildIndexExpr(t, d + 1);
+      }
+    }
+  }
+
+  return "?";
+}
+
+// ---------------------------------------------------------------------------
+// Per-statement builders
+// ---------------------------------------------------------------------------
+
+ASTNode buildAssignNode(hlfir::AssignOp assign) {
+  ASTNode node;
+  node.kind = "assign";
+
+  // --- LHS ---
+  // For a designate destination, use ``expandDesignateChain`` so
+  // view-alias and section-parent chains (Fortran storage-association
+  // reshape, slice-into-multi-dim, etc.) decompose into the source
+  // array's full-rank coords.  The simple no-chain case still
+  // produces the same (target, indices) as the legacy code path.
+  auto dest = assign.getOperand(1);
+  if (auto dd = dest.getDefiningOp()) {
+    if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(dd)) {
+      // Struct field write (``g % y = ...``) -- the designate has
+      // a component attribute but no element subscripts.  Resolve
+      // to the flat ``<parent>_<member>`` name via
+      // ``traceToDecl`` on the designate's result (the
+      // component-aware walk fires) and DON'T treat it as an
+      // array write -- emit_assign downstream uses the registered
+      // VarInfo's descriptor classification to pick scalar vs
+      // array write.  Previously ``expandDesignateChain`` +
+      // ``traceToDecl(dg.getMemref())`` returned the struct base
+      // ``g``, leaking it as the target name.
+      if (dg.getComponentAttr() && dg.getIndices().empty()) {
+        node.target = traceToDecl(dg.getResult());
+      } else {
+        auto [arr, dims] = expandDesignateChain(dg);
+        node.target = arr.empty() ? traceToDecl(dg.getMemref()) : arr;
+        node.target_is_array = true;
+        AccessInfo wa;
+        wa.array_name = node.target;
+        wa.is_write = true;
+        for (auto& de : dims) {
+          wa.index_vars.push_back(de.var);
+          wa.index_exprs.push_back(de.expr);
+        }
+        node.accesses.push_back(std::move(wa));
+      }
+    } else {
+      node.target = traceToDecl(dest);
+    }
+  } else {
+    node.target = traceToDecl(dest);
+  }
+
+  // --- RHS expression string ---
+  auto src = assign.getOperand(0);
+  node.expr = buildExpr(src, 0);
+  if (node.expr == "?") {
+    if (auto d = src.getDefiningOp()) {
+      if (auto cst = mlir::dyn_cast<mlir::arith::ConstantOp>(d)) {
+        if (auto f = mlir::dyn_cast<mlir::FloatAttr>(cst.getValue())) {
+          std::ostringstream o;
+          o << std::setprecision(17) << f.getValueAsDouble();
+          node.expr = o.str();
+        } else if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(cst.getValue()))
+          node.expr = std::to_string(i.getInt());
+      }
+    }
+  }
+
+  // --- Collect RHS array reads ---
+  // We emit one AccessInfo per designate *occurrence* in the expression
+  // tree  --  not per unique designate op.  emit_tasklet counts array-name
+  // regex occurrences in ``assign_node.expr`` and wires one connector
+  // per occurrence, so the bridge must supply matching AccessInfo count.
+  // For ``g * g`` Flang shares ``%gv = fir.load %gi`` across both mulf
+  // operands; without per-occurrence emission the second ``g`` becomes
+  // a dangling ``_in_g_1`` connector with no memlet.
+  std::function<void(mlir::Value, int)> collectReads = [&](mlir::Value v, int depth) {
+    if (depth > 40) return;
+    auto* op = v.getDefiningOp();
+    if (!op) return;
+    // ``fir.box_dims`` reads only the descriptor's shape/bounds metadata --
+    // ``buildDesignateIndexExpr`` already renders those bounds as shape/offset
+    // SYMBOLS in the index exprs (``jc + offset_..._d0 - 1``), never a data
+    // element.  Recursing into its box operand re-hits the ARRAY's own
+    // designate and records a spurious WHOLE-array read (index ``[aos_idx]``
+    // only) -- a rank-1 memlet on the real rank-N array that fails
+    // ``sdfg.validate`` (the AoS-member ``patch_3d % p_patch_1d(1) % <member>``
+    // offset-in-subscript shape: one bogus read per non-1-based dim).  The box
+    // carries no data read of its own, so stop the walk here.  Match by op
+    // name (the same form the ``buildIndexExpr`` box_dims handler above uses) --
+    // a typed ``isa<fir::BoxDimsOp>`` does not catch this dialect's op here.
+    if (op->getName().getStringRef() == "fir.box_dims") return;
+    if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(op)) {
+      // Use ``expandDesignateChain`` so AoR shapes
+      // (``arr(i) % x(2)`` -- a chain of two designates) produce an
+      // AccessInfo with the FLAT name ``arr_x`` and BOTH indices
+      // ``[record, field]``.  Without the chain expansion this
+      // lambda's local code only captured the innermost designate's
+      // indices (the field) and traced to the struct-base name --
+      // missing the record index and using the unflattened ``arr``
+      // form.  See elementals.cpp::expandDesignateChain for the
+      // AoR-aware walk + flat-name flattening.
+      auto [arr, dims] = expandDesignateChain(dg);
+      AccessInfo ra;
+      ra.array_name = arr;
+      ra.is_read = true;
+      for (auto& de : dims) {
+        ra.index_vars.push_back(de.var);
+        ra.index_exprs.push_back(de.expr);
+      }
+      // Descend into each index operand so inner indirect loads
+      // (edge_idx used below z_kin) get their own AccessInfo.
+      for (auto idx : dg.getIndices()) {
+        collectReads(idx, depth + 1);
+      }
+      node.accesses.push_back(std::move(ra));
+      return;
+    }
+    // ``hlfir.apply %elem, %i``  --  recurse into the referenced
+    // elemental's body so reads inside it get tracked.  Mirrors the
+    // global ``collectReadAccesses`` handler in elementals.cpp.
+    // Without this, ``hlfir.assign (apply elem, i) to dst`` (the
+    // shape produced by ``hlfir-expand-vector-subscript-gather``' gather
+    // loop) registers no read connectors and the tasklet body
+    // references a free-floating array name.
+    if (auto apply = mlir::dyn_cast<hlfir::ApplyOp>(op)) {
+      auto src = apply.getExpr();
+      if (auto* sd = src.getDefiningOp()) {
+        if (auto inner_elem = mlir::dyn_cast<hlfir::ElementalOp>(sd)) {
+          auto& ireg = inner_elem.getRegion();
+          if (!ireg.empty()) {
+            auto& iblock = ireg.front();
+            auto apply_idxs = apply.getIndices();
+            unsigned pushed = 0;
+            for (unsigned i = 0; i < iblock.getNumArguments() && i < apply_idxs.size(); ++i) {
+              auto name = resolveIndex(apply_idxs[i]);
+              indexStack().emplace_back(iblock.getArgument(i), name);
+              ++pushed;
+            }
+            for (auto& iop : iblock)
+              if (auto y = mlir::dyn_cast<hlfir::YieldElementOp>(iop)) collectReads(y.getElementValue(), depth + 1);
+            for (unsigned i = 0; i < pushed; ++i) indexStack().pop_back();
+          }
+        }
+      }
+      return;
+    }
+    // Scalar min/max idiom: ``arith.select(arith.cmpf|cmpi, t, f)``
+    // where buildExpr emits ``min(t, f)`` / ``max(t, f)``.  The cmp
+    // and the select reference the SAME ``t`` and ``f`` loads, so
+    // recursing into both branches would record 4 AccessInfos for
+    // the 2 textual operands ``min/max`` emits.  Skip the cmp's
+    // operands here so the AccessInfo count matches the textual
+    // occurrences emit_tasklet's regex sees.  Falls back to the
+    // generic operand walk for any select that doesn't match the
+    // idiom (in particular when t != cmp.lhs or f != cmp.rhs, which
+    // is the actual conditional-select shape).
+    if (auto sel = mlir::dyn_cast<mlir::arith::SelectOp>(op)) {
+      auto* cdef = sel.getCondition().getDefiningOp();
+      bool isMinMax = false;
+      if (auto cmp = mlir::dyn_cast_or_null<mlir::arith::CmpFOp>(cdef)) {
+        using P = mlir::arith::CmpFPredicate;
+        auto pred = cmp.getPredicate();
+        bool const ok_pred = (pred == P::OLT || pred == P::ULT || pred == P::OGT || pred == P::UGT);
+        if (ok_pred && cmp.getLhs() == sel.getTrueValue() && cmp.getRhs() == sel.getFalseValue()) isMinMax = true;
+      }
+      if (!isMinMax) {
+        if (auto cmp = mlir::dyn_cast_or_null<mlir::arith::CmpIOp>(cdef)) {
+          using P = mlir::arith::CmpIPredicate;
+          auto pred = cmp.getPredicate();
+          bool const ok_pred = (pred == P::slt || pred == P::ult || pred == P::sgt || pred == P::ugt);
+          if (ok_pred && cmp.getLhs() == sel.getTrueValue() && cmp.getRhs() == sel.getFalseValue()) isMinMax = true;
+        }
+      }
+      if (isMinMax) {
+        collectReads(sel.getTrueValue(), depth + 1);
+        collectReads(sel.getFalseValue(), depth + 1);
+        return;
+      }
+    }
+    for (auto operand : op->getOperands()) collectReads(operand, depth + 1);
+  };
+  collectReads(src, 0);
+
+  return node;
+}
+
+int64_t traceLB(mlir::Value v) {
+  if (auto c = traceConstInt(v)) return *c;
+  return -1;
+}
+
+/// Peel `fir.ref<...>` / `fir.box<...>` / `fir.heap<...>` / `fir.ptr<...>`
+/// wrappers.
+mlir::Type peelWrappers(mlir::Type t) {
+  for (int i = 0; i < limits::kTypeWrapperPeelDepth; ++i) {
+    mlir::Type next = t;
+    if (auto b = mlir::dyn_cast<fir::BoxType>(next))
+      next = b.getEleTy();
+    else if (auto r = mlir::dyn_cast<fir::ReferenceType>(next))
+      next = r.getEleTy();
+    else if (auto h = mlir::dyn_cast<fir::HeapType>(next))
+      next = h.getEleTy();
+    else if (auto p = mlir::dyn_cast<fir::PointerType>(next))
+      next = p.getEleTy();
+    else
+      break;
+    t = next;
+  }
+  return t;
+}
+
+/// True iff the MLIR type peels to a ``fir.array<...>`` OR is an
+/// ``!hlfir.expr<...>`` value with a non-empty shape.  The latter is
+/// what every ``hlfir.elemental`` / ``hlfir.matmul`` / ``hlfir.transpose``
+/// produces; the bridge has to treat those as arrays so that
+/// ``hlfir.assign %elem to %dst`` routes through the elemental walker
+/// (or libcall handler) rather than the section-scalar fallback that
+/// only knows how to broadcast a scalar across a slice.
+bool isArrayRef(mlir::Type t) {
+  auto peeled = peelWrappers(t);
+  if (mlir::isa<fir::SequenceType>(peeled)) return true;
+  if (auto e = mlir::dyn_cast<hlfir::ExprType>(peeled)) return !e.getShape().empty();
+  return false;
+}
+
+/// True iff ``v`` traces back to an ``arith.constant`` with value zero
+/// (integer zero or floating-point +0.0 / -0.0).
+bool isConstantZero(mlir::Value v) {
+  auto* def = v.getDefiningOp();
+  if (!def) return false;
+  if (auto cv = mlir::dyn_cast<fir::ConvertOp>(def)) return isConstantZero(cv.getValue());
+  if (auto c = mlir::dyn_cast<mlir::arith::ConstantOp>(def)) {
+    if (auto f = mlir::dyn_cast<mlir::FloatAttr>(c.getValue())) return f.getValueAsDouble() == 0.0;
+    if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(c.getValue())) return i.getInt() == 0;
+  }
+  return false;
+}
+
+/// ``hlfir.assign %src to %dst`` where both sides are array boxes  --  a
+/// whole-array copy.  Emit ``kind="copy"`` and let hlfir_to_sdfg wire a
+/// ``standard.CopyLibraryNode``.
+ASTNode buildCopyNode(hlfir::AssignOp assign) {
+  ASTNode n;
+  n.kind = "copy";
+  auto dest = assign.getOperand(1);
+  // Always route through traceToDecl so the allocatable alias map
+  // (set by ``ALLOCATE`` walks in buildAST) takes effect  --  direct
+  // ``extractName(decl.getUniqName())`` would skip the alias lookup
+  // and stale-bind to the first allocation's name.
+  if (auto dd = dest.getDefiningOp())
+    if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(dd))
+      n.target = allocAliasFor(extractName(decl.getUniqName().str()));
+  if (n.target.empty()) n.target = traceToDecl(dest);
+  n.target_is_array = true;
+  n.reduce_src = traceToDecl(assign.getOperand(0));
+  return n;
+}
+
+/// ``hlfir.assign %zero to %dst`` where source is a constant zero and dest
+/// is an array box  --  a zero-fill.  Emit ``kind="memset"`` so
+/// hlfir_to_sdfg can wire a ``standard.FillLibraryNode``.
+/// Return ``dg`` if ``v`` comes from an ``hlfir.designate`` whose
+/// ``is_triplet`` attribute marks at least one dimension as a section
+/// (lower:upper:stride).  Used by the Phase-1 array-section lowering to
+/// split section assignments off from plain indexed designates before
+/// the reduce / elemental dispatch.
+hlfir::DesignateOp asSectionDesignate(mlir::Value v) {
+  auto* def = v.getDefiningOp();
+  if (!def) return {};
+  auto dg = mlir::dyn_cast<hlfir::DesignateOp>(def);
+  if (!dg) return {};
+  for (bool const t : dg.getIsTriplet())
+    if (t) return dg;
+  return {};
+}
+
+/// Per-dim spec for an ``hlfir.designate``: either a triplet
+/// (lo:hi:stride) or a scalar index.  Used by section helpers to walk
+/// LHS / RHS uniformly without re-parsing the flat operand list.
+struct DesignateDim {
+  bool isTriplet;
+  std::string lo;           // buildIndexExpr (Fortran 1-based, 0)  --  triplet only
+  std::string hi;           // triplet only
+  std::string strideExpr;   // empty when stride literal == 1
+  int64_t strideConst = 1;  // when strideExpr is empty, the literal stride
+  std::string scalarIdx;    // non-triplet only
+};
+
+/// Walk a designate's per-dim ``isTriplet`` flags and group its flat
+/// index operands accordingly.  Returns ``false`` (and leaves ``out``
+/// undefined) when an operand can't be lowered to a string  --  caller
+/// must decide whether that's recoverable or a hard error.
+/// ``fir.box_dims`` rendered as the descriptor symbols the bridge already mints: result #0 is the lower bound
+/// (Fortran default 1 -- a non-default lb is modelled separately as ``offset_<arr>_d<i>``), result #1 the extent
+/// ``<arr>_d<dim>``.  Returns "" when it cannot be resolved.
+///
+/// Deliberately used ONLY for a rank-reducing designate's triplet bounds (see ``parseDesignateDims``). Flang
+/// writes ``arr(:, 1)`` as ``arr(1:box_dims(arr,0)#1:1, 1)``, and without resolving that bound the section assign
+/// bails to ``buildCopyNode``'s WHOLE-ARRAY copy, which ignores the scalar dim: d0*d1 elements written into a
+/// d0-sized halo buffer (the ICON ``sync_patch_array`` heap overflow). Widening this to every designate instead
+/// re-lowers assigns that have been falling back for other reasons, which mints extent symbols for arrays that
+/// have no descriptor (a flattened derived-type array is one array PER MEMBER) -- so keep the scope tight.
+static std::string resolveBoxDimsBound(mlir::Value v) {
+  auto* def = v.getDefiningOp();
+  while (def) {
+    auto conv = mlir::dyn_cast<fir::ConvertOp>(def);
+    if (!conv) break;
+    v = conv.getValue();
+    def = v.getDefiningOp();
+  }
+  auto bd = mlir::dyn_cast_or_null<fir::BoxDimsOp>(def);
+  if (!bd) return "";
+  if (v == bd.getResult(0)) return "1";
+  if (v != bd.getResult(1)) return "";
+  auto dim = traceConstInt(bd.getDim());
+  if (!dim) return "";
+  // A derived-type array is flattened into one array per member, so the struct base name carries no descriptor
+  // and ``<base>_d<i>`` would be a symbol nothing defines.
+  auto ty = bd.getVal().getType();
+  if (auto b = mlir::dyn_cast<fir::BoxType>(ty)) ty = b.getEleTy();
+  if (auto r = mlir::dyn_cast<fir::ReferenceType>(ty)) ty = r.getEleTy();
+  if (auto h = mlir::dyn_cast<fir::HeapType>(ty)) ty = h.getEleTy();
+  if (auto p = mlir::dyn_cast<fir::PointerType>(ty)) ty = p.getEleTy();
+  auto seq = mlir::dyn_cast<fir::SequenceType>(ty);
+  if (!seq || mlir::dyn_cast<fir::RecordType>(seq.getEleTy())) return "";
+  auto base = traceToDecl(bd.getVal());
+  if (base.empty()) return "";
+  return base + "_d" + std::to_string(*dim);
+}
+
+static bool parseDesignateDims(hlfir::DesignateOp dg, std::vector<DesignateDim>& out) {
+  auto triplets = dg.getIsTriplet();
+  auto idxs = dg.getIndices();
+  // Only a designate that DROPS a dim can be miscompiled by the whole-array fallback; everything else keeps its
+  // existing behaviour (see ``resolveBoxDimsBound``).
+  bool rankReducing = false;
+  for (bool const isT : triplets)
+    if (!isT) rankReducing = true;
+  unsigned cursor = 0;
+  for (bool const isT : triplets) {
+    DesignateDim d;
+    d.isTriplet = isT;
+    if (isT) {
+      if (cursor + 3 > idxs.size()) return false;
+      d.lo = buildIndexExpr(idxs[cursor], 0);
+      d.hi = buildIndexExpr(idxs[cursor + 1], 0);
+      if (rankReducing) {
+        if (d.lo == "?" || d.lo.empty())
+          if (auto r = resolveBoxDimsBound(idxs[cursor]); !r.empty()) d.lo = r;
+        if (d.hi == "?" || d.hi.empty())
+          if (auto r = resolveBoxDimsBound(idxs[cursor + 1]); !r.empty()) d.hi = r;
+      }
+      if (d.lo.empty() || d.lo == "?" || d.hi.empty() || d.hi == "?") return false;
+      if (auto sc = traceConstInt(idxs[cursor + 2])) {
+        d.strideConst = *sc;
+      } else {
+        d.strideExpr = buildIndexExpr(idxs[cursor + 2], 0);
+        if (d.strideExpr.empty() || d.strideExpr == "?") return false;
+      }
+      cursor += 3;
+    } else {
+      if (cursor + 1 > idxs.size()) return false;
+      d.scalarIdx = buildIndexExpr(idxs[cursor], 0);
+      if (d.scalarIdx.empty() || d.scalarIdx == "?") return false;
+      cursor += 1;
+    }
+    out.push_back(std::move(d));
+  }
+  return true;
+}
+
+/// Lower ``<section_designate> = <scalar>`` as a rank-N nested
+/// ``kind="loop"`` wrapper around an inner ``kind="assign"``.  The
+/// designate may mix triplet and scalar dims  --  a triplet dim drives
+/// a loop and contributes its iter name to the write index; a scalar
+/// dim contributes its (Fortran 1-based) index expression directly so
+/// e.g. ``res(:, pos(1)) = nlev`` writes ``res[as_0, pos(1)]`` for
+/// every ``as_0`` in the slice.
+///
+/// Returns an empty vector when no triplet dim is present (caller
+/// should fall through  --  there is no section to broadcast over).
+std::vector<ASTNode> buildSectionScalarAssign(hlfir::AssignOp assign, hlfir::DesignateOp dst) {
+  std::vector<DesignateDim> dims;
+  if (!parseDesignateDims(dst, dims)) return {};
+  unsigned tripletRank = 0;
+  for (auto& d : dims)
+    if (d.isTriplet) ++tripletRank;
+  if (tripletRank == 0) return {};
+
+  std::vector<std::string> iter_names;
+  iter_names.reserve(tripletRank);
+  for (unsigned i = 0; i < tripletRank; ++i) iter_names.push_back("as_" + std::to_string(i));
+
+  auto dstName = traceToDecl(dst.getMemref());
+  if (dstName.empty()) return {};
+
+  // Inner assign: target[per-dim] = <scalar_rhs>.  Triplet dims use
+  // their iter; scalar dims thread their Fortran 1-based index expr.
+  ASTNode inner;
+  inner.kind = "assign";
+  inner.target = dstName;
+  inner.target_is_array = true;
+  inner.expr = buildExpr(assign.getOperand(0), 0);
+
+  // Per-dst-dim index: a triplet dim contributes its loop iter, a scalar dim
+  // its (Fortran 1-based) index expr.
+  std::vector<std::string> srcIdx;
+  {
+    unsigned tDim = 0;
+    for (auto& d : dims) srcIdx.push_back(d.isTriplet ? iter_names[tDim++] : d.scalarIdx);
+  }
+  // Compose parent actual-arg sections.  When the section-scalar-assign target
+  // is an INLINED DUMMY whose actual arg is itself a section
+  // (``div_vec_c(:, :) = 0`` inside a worker bound to ``z_div_c(:, :,
+  // blockno)``), ``traceToDecl`` already resolved ``dstName`` to the SOURCE
+  // array (``z_div_c``), so the write must carry the source's FULL rank: every
+  // parent section's fixed scalar dim (``blockno``) has to be spliced into the
+  // index at its source-dim position.  Each parent-section triplet dim consumes
+  // one running index entry (the dummy's surviving dim, already an iter); each
+  // parent scalar dim inserts its own index.  This is the section-target twin
+  // of the triplet/scalar parent walk ``expandDesignateChain`` runs for the
+  // element-write path -- without it the fill writes a rank-deficient memlet
+  // (``z_div_c[as_0, as_1]`` on a rank-3 array).  A direct (non-dummy) target
+  // has no parent section, so the walk is a no-op and the index is unchanged.
+  {
+    mlir::Value pv = dst.getMemref();
+    for (int hop = 0; hop < limits::kSsaBackWalkDepth && pv; ++hop) {
+      if (mlir::Value const peeled = peelBoxReinterpret(pv); peeled != pv) {
+        pv = peeled;
+        continue;
+      }
+      auto* pdop = pv.getDefiningOp();
+      if (!pdop) break;
+      if (auto pdecl = mlir::dyn_cast<hlfir::DeclareOp>(pdop)) {
+        if (!pdecl.getDummyScope()) {  // inlined alias -- keep walking to the section
+          pv = pdecl.getMemref();
+          continue;
+        }
+        break;  // a real dummy scope: the section base bottoms out here
+      }
+      auto pdg = mlir::dyn_cast<hlfir::DesignateOp>(pdop);
+      if (!pdg) break;
+      if (pdg.getIsTriplet().empty()) {  // component / element hop, no dims to compose
+        pv = pdg.getMemref();
+        continue;
+      }
+      std::vector<DesignateDim> pdims;
+      if (!parseDesignateDims(pdg, pdims)) break;
+      std::vector<std::string> composed;
+      size_t cur = 0;
+      for (auto& pd : pdims) {
+        if (pd.isTriplet)
+          composed.push_back(cur < srcIdx.size() ? srcIdx[cur++] : std::string("?"));
+        else
+          composed.push_back(pd.scalarIdx);
+      }
+      for (; cur < srcIdx.size(); ++cur) composed.push_back(srcIdx[cur]);
+      srcIdx = std::move(composed);
+      pv = pdg.getMemref();
+    }
+  }
+
+  AccessInfo wa;
+  wa.array_name = dstName;
+  wa.is_write = true;
+  for (auto& idx : srcIdx) {
+    wa.index_vars.push_back(idx);
+    wa.index_exprs.push_back(idx);
+  }
+  inner.accesses.push_back(std::move(wa));
+
+  // Bug fix: also collect read accesses on the scalar RHS.
+  // ``inner.expr`` is the rendered RHS string (e.g. ``bob(1)``),
+  // and Python ``emit_tasklet`` rewrites every array-name occurrence
+  // to ``_in_<name>_<N>`` and creates one in_connector + memlet PER
+  // ``AccessInfo`` in ``inner.accesses``.  Without read AccessInfos
+  // here the connector references in the rewritten code become
+  // dangling  --  and DaCe's free-symbol analysis later treats the
+  // unbound ``_in_<name>_<N>`` token as an undefined symbol,
+  // surfacing as ``KeyError: '_in_bob_0'`` at SDFG construction.
+  // Mirrors the ``collectReads`` walker inside ``buildAssignNode``
+  // (lines ~304-361 above); kept inline rather than extracted as a
+  // free helper because the only shared piece would be the walker
+  // and the AccessInfo emission, which already differs in subtle
+  // ways (no per-dim ``index_vars`` reset rules at the section level).
+  std::function<void(mlir::Value, int)> collectScalarRhsReads = [&](mlir::Value v, int depth) {
+    if (depth > 40) return;
+    auto* op = v.getDefiningOp();
+    if (!op) return;
+    if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(op)) {
+      AccessInfo ra;
+      ra.array_name = traceToDecl(dg.getMemref());
+      ra.is_read = true;
+      unsigned di = 0;
+      for (auto idx : dg.getIndices()) {
+        auto n = resolveIndex(idx);
+        ra.index_vars.push_back(n.empty() ? "?" : n);
+        ra.index_exprs.push_back(buildDesignateIndexExpr(dg, di, idx, 0));
+        ++di;
+        collectScalarRhsReads(idx, depth + 1);
+      }
+      inner.accesses.push_back(std::move(ra));
+      return;
+    }
+    for (auto operand : op->getOperands()) collectScalarRhsReads(operand, depth + 1);
+  };
+  collectScalarRhsReads(assign.getOperand(0), 0);
+
+  // Wrap descending so the outermost ASTNode is the outermost loop.
+  // Lower bound goes into loop_lower_expr (string form) so symbolic
+  // lowers like ``res(a:b)`` survive  --  emit_loop prefers it over the
+  // int ``loop_lower`` when non-empty.
+  ASTNode current = inner;
+  {
+    unsigned tDim = tripletRank;
+    for (auto it = dims.rbegin(); it != dims.rend(); ++it) {
+      if (!it->isTriplet) continue;
+      --tDim;
+      ASTNode wrap;
+      wrap.kind = "loop";
+      wrap.loop_iter = iter_names[tDim];
+      wrap.loop_lower_expr = it->lo;
+      wrap.loop_bound = it->hi;
+      wrap.children.push_back(current);
+      current = wrap;
+    }
+  }
+  return {current};
+}
+
+/// ``<section> = <other_section>`` where both sides are
+/// ``hlfir.designate`` ops carrying section info  --  e.g.
+/// ``res(nval, pos(1):pos(2)) = input1(nval, pos(3):pos(4))`` from
+/// ECRAD's pattern.  Without this the dispatcher would route to
+/// ``buildCopyNode`` (whole-array copy) and silently ignore the
+/// scalar / triplet structure on each side.
+///
+/// Strategy: synthesise one outer loop per LHS triplet dim, iterating
+/// over the LHS bounds.  Inside, write at the LHS dims (scalar ->
+/// scalar index, triplet -> loop iter) and read at the RHS dims
+/// (triplet -> loop iter shifted by ``rhs_lo - lhs_lo``).
+///
+/// Loud-failure contract: returns ``empty`` only when this dispatch
+/// arm doesn't apply (src isn't a designate AND isn't a bare-declare
+/// matching the LHS triplet count, or neither side has any triplet).
+/// Once we've confirmed both sides carry sections, any shape / stride
+/// mismatch throws ``std::runtime_error`` rather than falling back to
+/// a wrong answer.  The dispatcher relies on this  --  it does NOT have
+/// a section-to-section recovery path.
+// Strip the ``ref`` / ``box`` / ``heap`` / ``pointer`` wrappers off a declared type until the underlying
+// ``fir.array`` (or a non-wrapper) is reached.  An ALLOCATABLE/POINTER declares as ``ref<box<heap<array>>>`` --
+// the box is nested INSIDE the ref, so a single ordered pass of ``if (box) ... if (ref) ...`` never unwraps it.
+static mlir::Type peelToSequence(mlir::Type ty) {
+  for (bool peeled = true; peeled;) {
+    peeled = false;
+    if (auto b = mlir::dyn_cast<fir::BoxType>(ty)) {
+      ty = b.getEleTy();
+      peeled = true;
+    } else if (auto r = mlir::dyn_cast<fir::ReferenceType>(ty)) {
+      ty = r.getEleTy();
+      peeled = true;
+    } else if (auto h = mlir::dyn_cast<fir::HeapType>(ty)) {
+      ty = h.getEleTy();
+      peeled = true;
+    } else if (auto p = mlir::dyn_cast<fir::PointerType>(ty)) {
+      ty = p.getEleTy();
+      peeled = true;
+    }
+  }
+  return ty;
+}
+
+std::vector<ASTNode> buildSectionToSectionAssign(hlfir::AssignOp assign, mlir::Value dst) {
+  auto srcVal = assign.getOperand(0);
+  auto* srcDef = srcVal.getDefiningOp();
+  if (!srcDef) return {};
+
+  // Destination form parallels the src dispatch below: a designate
+  // with triplets carries its own slicing, while a bare declare
+  // means whole-array (synthesise full-extent triplets, lo=1, the
+  // hi unused since RHS section bounds drive the loop).  This
+  // symmetric handling is what lets ``t0_w = p%pprog(1)%w``
+  // (LHS bare decl, RHS section) lower to a per-element loop
+  // instead of falling through to ``buildCopyNode`` (which would
+  // copy the whole 3D companion).
+  auto* dstDef = dst.getDefiningOp();
+  if (!dstDef) return {};
+  auto dstDg = mlir::dyn_cast<hlfir::DesignateOp>(dstDef);
+  auto dstDecl = mlir::dyn_cast<hlfir::DeclareOp>(dstDef);
+  if (!dstDg && !dstDecl) return {};
+
+  // ``dstTC`` (triplet count) is set up-front for both forms so the
+  // rank-match check below can fire before we parse per-dim details.
+  // Bare-decl: every dim is a triplet, so rank == triplet count.
+  std::string dstName;
+  unsigned dstTC = 0;
+  if (dstDg) {
+    auto dstTriplets = dstDg.getIsTriplet();
+    if (dstTriplets.empty()) return {};
+    for (bool const t : dstTriplets)
+      if (t) dstTC++;
+    if (dstTC == 0) return {};
+    dstName = traceToDecl(dstDg.getMemref());
+  } else {
+    dstName = allocAliasFor(extractName(dstDecl.getUniqName().str()));
+    // An ALLOCATABLE/POINTER declares as ``ref<box<heap<array>>>`` -- the box sits INSIDE the ref. A single
+    // sequential peel (box-then-ref-then-heap) checks box before it has peeled the ref, so it never unwraps and
+    // dstTC stays 0. Loop until the wrappers are gone: this is the exact shape of a Fortran halo send buffer
+    // (``sync_sbuf = arr(:, 1)``), and leaving it unpeeled bailed the section path into a whole-array copy that
+    // overran the buffer.
+    auto ty = peelToSequence(dstDecl.getResult(0).getType());
+    if (auto seq = mlir::dyn_cast<fir::SequenceType>(ty)) dstTC = seq.getShape().size();
+    if (dstTC == 0) return {};
+  }
+  if (dstName.empty()) return {};
+
+  // Source can be either a designate (its own slicing) or a bare
+  // ``hlfir.declare`` (whole array  --  treated as all-triplet ``(:)``
+  // dims with default lower bound 1, stride 1).  The whole-array
+  // case is what flang produces for ``res(<section>) = arr`` where
+  // ``arr`` is a 1D dummy and the LHS section has matching triplet
+  // rank.
+  auto srcDg = mlir::dyn_cast<hlfir::DesignateOp>(srcDef);
+  auto srcDecl = mlir::dyn_cast<hlfir::DeclareOp>(srcDef);
+  // A whole-array ALLOCATABLE/POINTER RHS (``arr(:, 2) = sbuf`` with sbuf allocatable) reaches the assign as a
+  // ``fir.load`` of its descriptor box, NOT a bare declare -- an automatic ``sbuf(SIZE(arr,1))`` is a direct
+  // declare and already hits the branch below.  Peel the load to the underlying declare so the whole-array-source
+  // path still fires; without it the section assign bails to ``buildCopyNode``, which writes the WHOLE dst (the
+  // halo sync-buffer transpose: ``sbuf`` scattered across all of ``arr`` instead of column 2).
+  if (!srcDg && !srcDecl)
+    if (auto ld = mlir::dyn_cast<fir::LoadOp>(srcDef))
+      srcDecl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(ld.getMemref().getDefiningOp());
+  if (!srcDg && !srcDecl) return {};
+
+  // Falling back to ``buildCopyNode``'s whole-array copy is only sound when neither side drops a dimension: a
+  // designate with a SCALAR dim selects a slice of a larger array, so copying the whole thing runs past the
+  // destination (this is how ``sync_sbuf = arr(:, 1)`` overran a one-column halo buffer by a factor of d1).
+  // Where bounds don't parse and a dim is dropped, refuse -- a wrong answer that runs beats no build only until
+  // it corrupts the heap.
+  auto rankReducing = [](hlfir::DesignateOp dg) {
+    if (!dg) return false;
+    for (bool const isT : dg.getIsTriplet())
+      if (!isT) return true;
+    return false;
+  };
+  auto refuseUnparseable = [&](hlfir::DesignateOp dg, const char* side) {
+    if (!rankReducing(dg)) return;
+    throw std::runtime_error(std::string("section-to-section assign on \"") + dstName + "\": " + side +
+                             " designate has a scalar (rank-reducing) dim but its bounds did not parse; a "
+                             "whole-array copy would read or write outside the section");
+  };
+
+  std::string srcName;
+  std::vector<DesignateDim> srcDims;
+  unsigned srcTC = 0;
+  if (srcDg) {
+    srcName = traceToDecl(srcDg.getMemref());
+    if (srcName.empty()) return {};
+    if (!parseDesignateDims(srcDg, srcDims)) {
+      refuseUnparseable(srcDg, "src");
+      return {};
+    }
+    for (auto& d : srcDims)
+      if (d.isTriplet) ++srcTC;
+  } else {
+    // Bare declare: synthesise per-dim full-extent triplets matching
+    // the underlying array's rank.  The K-th triplet's lo / hi
+    // expressions are the same shape resolveExtent gives back  --
+    // here we only need ``lo == "1"`` for the source-shift formula
+    // (``rhs_lo - lhs_lo``); the actual bounds aren't used because
+    // the loop bounds come from the LHS.
+    srcName = allocAliasFor(extractName(srcDecl.getUniqName().str()));
+    if (srcName.empty()) return {};
+    // Determine src rank from the underlying type; peel wrappers in any nesting order (see the dst path).
+    auto ty = peelToSequence(srcDecl.getResult(0).getType());
+    unsigned rank = 0;
+    if (auto seq = mlir::dyn_cast<fir::SequenceType>(ty)) rank = seq.getShape().size();
+    if (rank == 0) return {};
+    for (unsigned i = 0; i < rank; ++i) {
+      DesignateDim d;
+      d.isTriplet = true;
+      d.lo = "1";
+      d.hi = "1";  // unused; loop bounds come from LHS
+      srcDims.push_back(std::move(d));
+    }
+    srcTC = rank;
+  }
+
+  // Triplet rank mismatch  --  definitively wrong; ``buildCopyNode``
+  // would produce a whole-array copy that silently ignores the
+  // mismatched scalar / triplet structure.  Throw loudly.
+  if (dstTC != srcTC)
+    throw std::runtime_error("section-to-section assign \"" + dstName + " = " + srcName +
+                             "\": triplet rank mismatch (dst=" + std::to_string(dstTC) +
+                             ", src=" + std::to_string(srcTC) + ")");
+
+  // Same guard as on the source side above: an unparseable rank-reducing designate must not degrade to a
+  // whole-array copy.
+  std::vector<DesignateDim> dstDims;
+  if (dstDg) {
+    if (!parseDesignateDims(dstDg, dstDims)) {
+      refuseUnparseable(dstDg, "dst");
+      return {};
+    }
+  } else {
+    // Bare decl: synthesise full-extent triplets per dim, mirroring
+    // the bare-source path above.  Loop bounds come from the src
+    // section (see boundsSide selection later); the lo="1" here
+    // just feeds the per-dim source-shift formula and keeps the
+    // memlet index expression Fortran 1-based.
+    for (unsigned i = 0; i < dstTC; ++i) {
+      DesignateDim d;
+      d.isTriplet = true;
+      d.lo = "1";
+      d.hi = "1";  // unused; loop bounds come from RHS
+      dstDims.push_back(std::move(d));
+    }
+  }
+
+  // Stride: only stride 1 is supported on both sides for now.  Any
+  // non-1 stride is rejected loudly so the caller is forced to confront
+  // it (silently flattening to stride 1 would compute the wrong
+  // elements, e.g. ``arr(1:9:2)`` covering 5 odd indices vs. the first
+  // 5 contiguous indices a stride-1 lowering would touch).
+  auto dimStrideStr = [](const DesignateDim& d) -> std::string {
+    if (!d.strideExpr.empty()) return d.strideExpr;
+    return std::to_string(d.strideConst);
+  };
+  for (size_t i = 0; i < dstDims.size(); ++i)
+    if (dstDims[i].isTriplet && (!dstDims[i].strideExpr.empty() || dstDims[i].strideConst != 1)) {
+      std::string msg = "section-to-section assign \"";
+      msg += dstName;
+      msg += " = ";
+      msg += srcName;
+      msg += "\": LHS stride ";
+      msg += dimStrideStr(dstDims[i]);
+      msg += " on dim ";
+      msg += std::to_string(i);
+      msg += " not yet supported";
+      throw std::runtime_error(msg);
+    }
+  for (size_t i = 0; i < srcDims.size(); ++i)
+    if (srcDims[i].isTriplet && (!srcDims[i].strideExpr.empty() || srcDims[i].strideConst != 1)) {
+      std::string msg = "section-to-section assign \"";
+      msg += dstName;
+      msg += " = ";
+      msg += srcName;
+      msg += "\": RHS stride ";
+      msg += dimStrideStr(srcDims[i]);
+      msg += " on dim ";
+      msg += std::to_string(i);
+      msg += " not yet supported";
+      throw std::runtime_error(msg);
+    }
+
+  std::vector<std::string> iter_names;
+  iter_names.reserve(dstTC);
+  for (unsigned i = 0; i < dstTC; ++i) iter_names.push_back("ss_" + std::to_string(i));
+
+  // Build LHS write-index list (and remember per-tDim lo for the source
+  // shift).  Triplet -> loop iter; scalar -> the scalar index expression.
+  // The loop iterates in the bounds-bearing side's coords (dst when a designate, else the
+  // src section); the OTHER side's index shifts by (own_lo - bounds_lo). Both sides shift,
+  // so a bare-decl dst reading a src section lands writes at the loop coord, not the dst lo.
+  const bool boundsFromDst = static_cast<bool>(dstDg);
+  std::vector<std::string> srcLoExprs;
+  for (auto& d : srcDims)
+    if (d.isTriplet) srcLoExprs.push_back(d.lo);
+
+  AccessInfo wa;
+  wa.array_name = dstName;
+  wa.is_write = true;
+  std::vector<std::string> dstLoExprs;
+  {
+    unsigned tDim = 0;
+    for (auto& d : dstDims) {
+      if (d.isTriplet) {
+        dstLoExprs.push_back(d.lo);
+        const std::string& blo = boundsFromDst ? d.lo : srcLoExprs[tDim];
+        std::string ix;
+        if (d.lo == blo) {
+          ix = iter_names[tDim];
+        } else {
+          ix = "(" + iter_names[tDim] + " + " + d.lo + " - " + blo + ")";
+        }
+        wa.index_vars.push_back(iter_names[tDim]);
+        wa.index_exprs.push_back(std::move(ix));
+        tDim++;
+      } else {
+        wa.index_vars.push_back(d.scalarIdx);
+        wa.index_exprs.push_back(d.scalarIdx);
+      }
+    }
+  }
+
+  // Build RHS read-index list, aligning by tDim.  When src_lo == bounds_lo skip the
+  // redundant shift so the memlet stays simple (DaCe's simplifier doesn't always fold it).
+  AccessInfo ra;
+  ra.array_name = srcName;
+  ra.is_read = true;
+  {
+    unsigned tDim = 0;
+    for (auto& d : srcDims) {
+      if (d.isTriplet) {
+        const std::string& blo = boundsFromDst ? dstLoExprs[tDim] : d.lo;
+        std::string ix;
+        if (d.lo == blo) {
+          ix = iter_names[tDim];
+        } else {
+          ix = "(" + iter_names[tDim] + " + " + d.lo + " - " + blo + ")";
+        }
+        ra.index_vars.push_back(iter_names[tDim]);
+        ra.index_exprs.push_back(std::move(ix));
+        tDim++;
+      } else {
+        ra.index_vars.push_back(d.scalarIdx);
+        ra.index_exprs.push_back(d.scalarIdx);
+      }
+    }
+  }
+
+  // ``inner.expr`` is just the bare source name  --  emit_tasklet's regex
+  // scan replaces it with ``_in_<srcName>_0`` and the AccessInfo
+  // (index_exprs) builds the memlet subset.  Subscripted forms in
+  // ``expr`` would re-index a connector and break codegen.
+  ASTNode inner;
+  inner.kind = "assign";
+  inner.target = dstName;
+  inner.target_is_array = true;
+  inner.expr = srcName;
+  inner.accesses.push_back(std::move(wa));
+  inner.accesses.push_back(std::move(ra));
+
+  // Wrap in nested loops over the bounds-bearing side's triplets
+  // (Fortran 1-based form so emit_loop's offset_<arr>_d<i>
+  // subtraction lands the write at the right element).  When the
+  // dst is a bare declare its synthesised dims carry placeholder
+  // hi="1"  --  drive the loop from src's section instead.  In the
+  // mirror case (bare-decl src, designate dst) dstDims already
+  // hold the real bounds, which has been the long-standing path.
+  ASTNode current = inner;
+  {
+    const auto& boundsSide = dstDg ? dstDims : srcDims;
+    std::vector<std::pair<std::string, std::string>> bounds;
+    for (auto& d : boundsSide)
+      if (d.isTriplet) bounds.emplace_back(d.lo, d.hi);
+    for (int i = (int)bounds.size() - 1; i >= 0; --i) {
+      ASTNode wrap;
+      wrap.kind = "loop";
+      wrap.loop_iter = iter_names[i];
+      wrap.loop_lower_expr = bounds[i].first;
+      wrap.loop_bound = bounds[i].second;
+      wrap.children.push_back(current);
+      current = wrap;
+    }
+  }
+  return {current};
+}
+
+/// ``hlfir.assign %scalar to %arr_decl`` where the destination is the bare
+/// declare for a whole array  --  Fortran's ``res = 3`` (broadcast scalar to
+/// every element).  Memset only handles the zero case; for any other
+/// constant we synthesise a nested loop that writes the scalar into every
+/// element.  Mirrors ``buildSectionScalarAssign``'s shape but iterates
+/// from 1 to the declare's extent for each dim instead of ``lo:hi``.
+///
+/// Returns an empty vector when the destination's shape can't be
+/// resolved  --  caller falls back to the default assign handler.
+std::vector<ASTNode> buildWholeArrayScalarBroadcast(hlfir::AssignOp assign) {
+  auto dst = assign.getOperand(1);
+  auto* dDef = dst.getDefiningOp();
+  if (!dDef) return {};
+  auto decl = mlir::dyn_cast<hlfir::DeclareOp>(dDef);
+  if (!decl) return {};
+  auto shape = decl.getShape();
+  if (!shape) return {};
+  auto* shDef = shape.getDefiningOp();
+  if (!shDef) return {};
+
+  // Collect per-dim extent operands.  ``fir.shape`` lists them flat;
+  // ``fir.shape_shift`` interleaves (lb, ext) pairs  --  pick out the
+  // extents (odd indices).
+  std::vector<mlir::Value> extents;
+  if (auto sh = mlir::dyn_cast<fir::ShapeOp>(shDef)) {
+    for (auto e : sh.getExtents()) extents.push_back(e);
+  } else if (auto ss = mlir::dyn_cast<fir::ShapeShiftOp>(shDef)) {
+    auto ops = ss->getOperands();
+    for (unsigned i = 1; i < ops.size(); i += 2) extents.push_back(ops[i]);
+  } else {
+    return {};
+  }
+  unsigned const rank = extents.size();
+  if (rank == 0) return {};
+
+  auto extentString = [](mlir::Value ext) -> std::string {
+    // Inline ``resolveExtent``-equivalent: prefer a traced declare,
+    // then a literal constant, otherwise a buildIndexExpr fallback.
+    if (!ext) return {};
+    auto n = traceToDecl(ext);
+    if (!n.empty()) return n;
+    if (auto c = traceConstInt(ext)) return std::to_string(*c);
+    auto idx = buildIndexExpr(ext, 0);
+    if (!idx.empty() && idx != "?") return "(" + idx + ")";
+    return {};
+  };
+
+  std::vector<std::string> bounds;
+  bounds.reserve(rank);
+  for (unsigned i = 0; i < rank; ++i) {
+    auto s = extentString(extents[i]);
+    if (s.empty()) return {};
+    bounds.push_back(std::move(s));
+  }
+
+  std::vector<std::string> iter_names;
+  iter_names.reserve(rank);
+  for (unsigned i = 0; i < rank; ++i) iter_names.push_back("ab_" + std::to_string(i));
+
+  ASTNode inner;
+  inner.kind = "assign";
+  inner.target = traceToDecl(dst);
+  inner.target_is_array = true;
+  inner.expr = buildExpr(assign.getOperand(0), 0);
+
+  AccessInfo wa;
+  wa.array_name = inner.target;
+  wa.is_write = true;
+  for (unsigned i = 0; i < rank; ++i) {
+    wa.index_vars.push_back(iter_names[i]);
+    wa.index_exprs.push_back(iter_names[i]);
+  }
+  inner.accesses.push_back(std::move(wa));
+
+  ASTNode current = inner;
+  for (int i = (int)rank - 1; i >= 0; --i) {
+    ASTNode wrap;
+    wrap.kind = "loop";
+    wrap.loop_iter = iter_names[i];
+    wrap.loop_lower = 1;
+    wrap.loop_bound = bounds[i];
+    wrap.children.push_back(current);
+    current = wrap;
+  }
+  return {current};
+}
+
+ASTNode buildMemsetNode(hlfir::AssignOp assign) {
+  ASTNode n;
+  n.kind = "memset";
+  auto dest = assign.getOperand(1);
+  if (auto dd = dest.getDefiningOp())
+    if (auto decl = mlir::dyn_cast<hlfir::DeclareOp>(dd))
+      n.target = allocAliasFor(extractName(decl.getUniqName().str()));
+  if (n.target.empty()) n.target = traceToDecl(dest);
+  n.target_is_array = true;
+  return n;
+}
+
+/// ``target = matmul(a, b)`` / ``transpose(a)`` / ``dot_product(x, y)`` /
+/// ``count(mask [,dim])``  --  the source of an hlfir.assign is a first-class
+/// hlfir linalg / reduction op.  Emit ``kind="libcall"`` so hlfir_to_sdfg
+/// can wire the matching DaCe library node.
+///
+/// For library nodes that take an integer ``dim`` argument
+/// (``hlfir.count`` etc.), the second operand is the dim value;
+/// trace it via ``traceConstInt`` and stash it in ``reduce_axes`` (0-based,
+/// same convention as ``buildReduceNode``).  ``emit_libcall`` reads it
+/// back and converts to Fortran 1-based for the library-node constructor.
+// Resolves a (possibly sliced) libcall operand to its DaCe array name + parallel subset string. Whole-array or
+// non-designate operands return an empty subset; a designate with >=1 triplet that can't be expressed throws (silently
+// flattening to the whole array would include trailing elements the slice meant to exclude). Subsets are DaCe-0-based
+// half-open ``lo:hi:stride`` (stride omitted when 1); symbolic bounds are parenthesised so ``__sym_pos_1 - 1`` doesn't
+// bind across an outer subtract. Free function (not a buildLibCallNode local) so the ddot-in-expression path can reuse
+// it -- see the hlfir.assign handler in dispatch.cpp.
+std::pair<std::string, std::string> resolveDesignateSliceSubset(mlir::Value operand, llvm::StringRef calleeName,
+                                                                unsigned argIdx) {
+  auto* def = operand.getDefiningOp();
+  if (!def) return {traceToDecl(operand), std::string{}};
+  auto dg = mlir::dyn_cast<hlfir::DesignateOp>(def);
+  if (!dg) return {traceToDecl(operand), std::string{}};
+  // Whole-member cartesian / AoS companion read (gate #12): ``dot_product(diag % pvd(i) % x, ...)`` -- the ``%x``
+  // designate selects the WHOLE array member (no triplet, no own indices) but ``traceToDecl`` resolved it to a
+  // FLATTENED companion (``diag_pvd_x``) carrying the outer element index(es) prepended. The element subscript lives on
+  // the MEMREF (``pvd(i)``), so the generic path below (which keys off the operand's own triplets) would read the whole
+  // multi-dim companion -- a 1-D-only libcall like dot_product then fails validation. Build the element subset
+  // ``[<outer idx>, 0:<member extent>]`` from the memref's element designate + the member's static extents.
+  if (dg.getComponentAttr() && dg.getIsTriplet().empty()) {
+    mlir::Type resTy = dg.getResult().getType();
+    if (auto rt = mlir::dyn_cast<fir::ReferenceType>(resTy)) resTy = rt.getEleTy();
+    if (auto seq = mlir::dyn_cast<fir::SequenceType>(resTy)) {
+      bool staticMember = true;
+      for (auto ext : seq.getShape())
+        if (ext == fir::SequenceType::getUnknownExtent()) staticMember = false;
+      mlir::Value mv = dg.getMemref();
+      for (int i = 0; staticMember && i < limits::kSsaBackWalkDepth && mv; ++i) {
+        auto* d = mv.getDefiningOp();
+        if (!d) break;
+        if (auto idg = mlir::dyn_cast<hlfir::DesignateOp>(d)) {
+          if (!idg.getComponentAttr() && !idg.getIndices().empty()) {
+            std::vector<DesignateDim> edims;
+            if (parseDesignateDims(idg, edims)) {
+              std::string sub;
+              for (auto& ed : edims)
+                if (!ed.isTriplet) {
+                  if (!sub.empty()) sub += ", ";
+                  sub += "(" + ed.scalarIdx + " - 1)";
+                }
+              for (auto ext : seq.getShape()) {
+                if (!sub.empty()) sub += ", ";
+                sub += "0:" + std::to_string(ext);
+              }
+              return {traceToDecl(operand), sub};
+            }
+          }
+          mv = idg.getMemref();
+          continue;
+        }
+        if (auto cv = mlir::dyn_cast<fir::ConvertOp>(d)) {
+          mv = cv.getValue();
+          continue;
+        }
+        if (auto ld = mlir::dyn_cast<fir::LoadOp>(d)) {
+          mv = ld.getMemref();
+          continue;
+        }
+        if (auto rb = mlir::dyn_cast<fir::ReboxOp>(d)) {
+          mv = rb.getBox();
+          continue;
+        }
+        if (auto ba = mlir::dyn_cast<fir::BoxAddrOp>(d)) {
+          mv = ba.getVal();
+          continue;
+        }
+        break;
+      }
+    }
+  }
+  auto triplets = dg.getIsTriplet();
+  if (triplets.empty()) return {traceToDecl(operand), std::string{}};
+  bool anyTriplet = false;
+  for (bool const t : triplets)
+    if (t) {
+      anyTriplet = true;
+      break;
+    }
+  if (!anyTriplet) return {traceToDecl(operand), std::string{}};
+
+  auto name = traceToDecl(dg.getMemref());
+  if (name.empty())
+    throw std::runtime_error("libcall \"" + std::string(calleeName) + "\" arg " + std::to_string(argIdx) +
+                             ": cannot resolve sliced operand's array name");
+
+  std::vector<DesignateDim> dims;
+  if (!parseDesignateDims(dg, dims))
+    throw std::runtime_error("libcall \"" + std::string(calleeName) + "\" arg " + std::to_string(argIdx) +
+                             ": cannot lower sliced designate of \"" + name + "\"");
+
+  // Walk dims and build the subset expression per dim. Track the flat-operand cursor manually so we can also peek at
+  // the raw mlir::Value for traceConstInt's tighter constant fold (avoids wrapping ``5`` as ``(5 - 1)`` when we can
+  // just emit ``4``).
+  std::string sub;
+  auto idxs = dg.getIndices();
+  unsigned flatCursor = 0;
+  for (const auto& dim : dims) {
+    if (!sub.empty()) sub += ", ";
+    if (dim.isTriplet) {
+      // DaCe 0-based half-open: lo - 1 : hi : stride. Drop the explicit ``:1`` stride to keep the common case readable.
+      std::string lo0;
+      if (auto c = traceConstInt(idxs[flatCursor])) {
+        lo0 = std::to_string(*c - 1);
+      } else {
+        lo0 = "(" + dim.lo + " - 1)";
+      }
+      sub += lo0 + ":" + dim.hi;
+      bool const strideIsOne = dim.strideExpr.empty() && dim.strideConst == 1;
+      if (!strideIsOne) {
+        sub += ":";
+        sub += dim.strideExpr.empty() ? std::to_string(dim.strideConst) : dim.strideExpr;
+      }
+      flatCursor += 3;
+    } else {
+      // Mixed scalar+slice: emit a single-element subset for the scalar dim so the memlet's rank matches the underlying
+      // array.
+      std::string idx0;
+      if (auto c = traceConstInt(idxs[flatCursor])) {
+        idx0 = std::to_string(*c - 1);
+      } else {
+        idx0 = "(" + dim.scalarIdx + " - 1)";
+      }
+      sub += idx0;
+      flatCursor += 1;
+    }
+  }
+  return {name, sub};
+}
+
+ASTNode buildLibCallNode(hlfir::AssignOp assign, mlir::Operation* srcOp, std::string_view callee) {
+  ASTNode n;
+  n.kind = "libcall";
+  n.callee = callee;
+
+  auto dest = assign.getOperand(1);
+  captureElementDesignateWrite(dest, n);
+  if (!n.target_is_array) n.target_is_array = isArrayRef(dest.getType());
+
+  // Linalg ops use call_args for every operand; reduction-style ops
+  // (count) treat the first operand as the array source and any
+  // remaining numeric operand as a dim/axis arg.
+
+  auto opName = srcOp->getName().getStringRef();
+  bool const is_count = (opName == "hlfir.count");
+  bool const is_minloc = (opName == "hlfir.minloc");
+  bool const is_maxloc = (opName == "hlfir.maxloc");
+  bool const is_cshift = (opName == "hlfir.cshift");
+  if (is_count) {
+    if (srcOp->getNumOperands() > 0) {
+      auto [nm, sub] = resolveDesignateSliceSubset(srcOp->getOperand(0), callee, 0);
+      n.call_args.push_back(nm);
+      n.call_arg_subsets.push_back(sub);
+    }
+    if (srcOp->getNumOperands() >= 2) {
+      auto dim_val = srcOp->getOperand(1);
+      if (auto c = traceConstInt(dim_val)) n.reduce_axes.push_back(*c - 1);  // Fortran 1-based -> 0-based
+    }
+  } else if (is_minloc || is_maxloc) {
+    // ``hlfir.minloc`` / ``hlfir.maxloc`` operand spec (see
+    // HLFIROps.td l470-498):
+    //   array (required)  [+ dim ($dim)]  [+ mask ($mask)]
+    //   [+ back ($back, i1)]
+    // Use the typed accessors so we honour the
+    // ``AttrSizedOperandSegments`` ABI (positional indices change
+    // depending on which optionals are present).
+    auto pushMask = [&](mlir::Value mask) {
+      auto [nm, sub] = resolveDesignateSliceSubset(mask, callee, 1);
+      n.call_args.push_back(nm);
+      n.call_arg_subsets.push_back(sub);
+    };
+    auto pushDim = [&](mlir::Value dim_val) {
+      if (auto c = traceConstInt(dim_val)) n.reduce_axes.push_back(*c - 1);
+    };
+    auto pushBack = [&](mlir::Value back_val) {
+      if (auto c = traceConstInt(back_val))
+        n.options["back"] = (*c != 0) ? "true" : "false";
+      else
+        n.options["back"] = "true";  // dynamic; safe default
+    };
+    if (auto minOp = mlir::dyn_cast<hlfir::MinlocOp>(srcOp)) {
+      auto [nm, sub] = resolveDesignateSliceSubset(minOp.getArray(), callee, 0);
+      n.call_args.push_back(nm);
+      n.call_arg_subsets.push_back(sub);
+      if (auto dim = minOp.getDim()) pushDim(dim);
+      if (auto mask = minOp.getMask()) pushMask(mask);
+      if (auto back = minOp.getBack()) pushBack(back);
+    } else if (auto maxOp = mlir::dyn_cast<hlfir::MaxlocOp>(srcOp)) {
+      auto [nm, sub] = resolveDesignateSliceSubset(maxOp.getArray(), callee, 0);
+      n.call_args.push_back(nm);
+      n.call_arg_subsets.push_back(sub);
+      if (auto dim = maxOp.getDim()) pushDim(dim);
+      if (auto mask = maxOp.getMask()) pushMask(mask);
+      if (auto back = maxOp.getBack()) pushBack(back);
+    }
+  } else if (is_cshift) {
+    // ``hlfir.cshift %array %shift [dim %dim]``.  Stash the source
+    // array name in ``call_args`` (whole-array memlet) and the shift
+    // expression in ``options["shift"]``; the optional dim lands in
+    // ``reduce_axes`` (0-based), matching MINLOC / MAXLOC.
+    if (auto cshOp = mlir::dyn_cast<hlfir::CShiftOp>(srcOp)) {
+      auto [nm, sub] = resolveDesignateSliceSubset(cshOp.getArray(), callee, 0);
+      n.call_args.push_back(nm);
+      n.call_arg_subsets.push_back(sub);
+      auto shiftVal = cshOp.getShift();
+      if (auto c = traceConstInt(shiftVal)) {
+        n.options["shift"] = std::to_string(*c);
+      } else {
+        auto sExpr = buildIndexExpr(shiftVal, 0);
+        if (sExpr.empty() || sExpr == "?") throw std::runtime_error("hlfir.cshift: cannot resolve shift expression");
+        n.options["shift"] = sExpr;
+      }
+      if (auto dim = cshOp.getDim()) {
+        if (auto c = traceConstInt(dim)) n.reduce_axes.push_back(*c - 1);
+      }
+    }
+  } else {
+    unsigned argIdx = 0;
+    for (auto operand : srcOp->getOperands()) {
+      // MATMUL fold: ``C = MATMUL(TRANSPOSE(A), B)`` and the
+      // symmetric ``MATMUL(A, TRANSPOSE(B))`` and combined
+      // ``MATMUL(TRANSPOSE(A), TRANSPOSE(B))`` cases.  Flang emits
+      // a separate ``%T = hlfir.transpose %X`` for each transposed
+      // operand and feeds ``%T`` into ``hlfir.matmul``.  Folding
+      // the transpose into the GEMM via ``transA`` / ``transB``
+      // avoids materialising a transposed transient (one fewer
+      // copy + one fewer BLAS call -- the BLAS already handles
+      // transpose in place via ``CblasTrans`` / ``CUBLAS_OP_T``).
+      // The fused ``hlfir.matmul_transpose`` op covers only the
+      // LHS-side; this fold catches the non-fused shapes the
+      // optimised-bufferisation pass leaves behind, plus the RHS
+      // and both-sides cases that don't have a fused op at all.
+      // ``matmul``: both operands eligible for the transpose fold.
+      // ``matmul_transpose``: only arg 1 (RHS) -- the LHS transpose
+      // is already in the op itself.  The materialiser in
+      // ``dispatch.cpp`` SKIPS pre-emitting the Transpose libcall
+      // for these positions, so the operand here IS the original
+      // ``hlfir.transpose`` op (not the materialised transient) and
+      // our ``dyn_cast<TransposeOp>`` succeeds.  Setting the
+      // matching BLAS flag here + re-binding to ``trans.getArray()``
+      // routes the matmul through the un-transposed source -- BLAS
+      // handles the transpose in-place via ``CblasTrans`` /
+      // ``CUBLAS_OP_T``.
+      bool const eligibleForFold = (callee == "matmul" && argIdx < 2) || (callee == "matmul_transpose" && argIdx == 1);
+      if (eligibleForFold) {
+        if (auto* def = operand.getDefiningOp()) {
+          if (auto trans = mlir::dyn_cast<hlfir::TransposeOp>(def)) {
+            n.options[argIdx == 0 ? "transA" : "transB"] = "true";
+            operand = trans.getArray();
+          }
+        }
+      }
+      auto [nm, sub] = resolveDesignateSliceSubset(operand, callee, argIdx);
+      n.call_args.push_back(nm);
+      n.call_arg_subsets.push_back(sub);
+      ++argIdx;
+    }
+  }
+  return n;
+}
+
+/// ``target = sum(a)`` / product / minval / maxval  --  one of the dedicated
+/// hlfir reduction ops appears as the source of an hlfir.assign.
+///
+/// Returned ASTNode carries enough metadata for hlfir_to_sdfg to call
+/// ``state.add_reduce(wcr, axes, identity)`` and wire the input / output
+/// memlets.  ``axes`` is left empty for whole-array reductions  --  Flang
+/// signals that by emitting the reduction op with no ``dim`` operand.
+/// Lower ``target = ANY/ALL/SUM/PRODUCT(src(lo:hi, ...))`` as a
+/// loop-accumulator: an init-to-identity assign followed by a
+/// ``kind="loop"`` whose body ORs / ANDs / sums the next section
+/// element into ``target``.  Used when the reduction's input is a
+/// section designate  --  DaCe's ``Reduce`` library node would read the
+/// whole source array and produce a wrong result.
+///
+/// Handles the common shape where the destination is a scalar or an
+/// element designate (``levelmask(jk)``) and the source has exactly
+/// the section dims to loop over; non-section dims of the source
+/// thread through via their existing indices (``jk`` here).  Returns
+/// an empty vector when the shape doesn't fit so the caller falls
+/// back to whole-array ``buildReduceNode``.
+std::vector<ASTNode> buildSectionReduceAssign(hlfir::AssignOp assign, hlfir::DesignateOp src, std::string_view pyOp,
+                                              std::string_view identity) {
+  auto triplets = src.getIsTriplet();
+  if (triplets.empty()) return {};
+  auto srcIndices = src.getIndices();
+
+  struct DimSpec {
+    bool isTriplet = false;
+    mlir::Value lo, hi, stride;
+    mlir::Value index;
+  };
+  std::vector<DimSpec> dims;
+  unsigned cursor = 0;
+  for (bool const t : triplets) {
+    DimSpec d;
+    d.isTriplet = t;
+    if (t) {
+      if (cursor + 3 > srcIndices.size()) return {};
+      d.lo = srcIndices[cursor++];
+      d.hi = srcIndices[cursor++];
+      d.stride = srcIndices[cursor++];
+    } else {
+      if (cursor + 1 > srcIndices.size()) return {};
+      d.index = srcIndices[cursor++];
+    }
+    dims.push_back(d);
+  }
+  unsigned sectionRank = 0;
+  for (auto& d : dims)
+    if (d.isTriplet) sectionRank++;
+  if (sectionRank == 0) return {};
+
+  std::vector<std::string> iterNames;
+  iterNames.reserve(sectionRank);
+  for (unsigned i = 0; i < sectionRank; ++i) iterNames.push_back("ar_" + std::to_string(i));
+
+  // Target name + index expressions  --  target may be a scalar (no
+  // designate) or an element designate like ``levelmask(jk)``.
+  auto dst = assign.getOperand(1);
+  std::string tgtName;
+  hlfir::DesignateOp tgtDg;
+  if (auto* dd = dst.getDefiningOp()) tgtDg = mlir::dyn_cast<hlfir::DesignateOp>(dd);
+  if (tgtDg)
+    tgtName = traceToDecl(tgtDg.getMemref());
+  else
+    tgtName = traceToDecl(dst);
+  if (tgtName.empty()) return {};
+
+  AccessInfo tgtWrite;
+  tgtWrite.array_name = tgtName;
+  tgtWrite.is_write = true;
+  if (tgtDg) {
+    for (auto idx : tgtDg.getIndices()) {
+      auto nm = resolveIndex(idx);
+      tgtWrite.index_vars.push_back(nm.empty() ? "?" : nm);
+      tgtWrite.index_exprs.push_back(buildIndexExpr(idx, 0));
+    }
+  }
+  bool const tgtIsArray = !tgtWrite.index_vars.empty();
+
+  AccessInfo tgtRead = tgtWrite;
+  tgtRead.is_write = false;
+  tgtRead.is_read = true;
+
+  // Source read  --  full base array name, indexed with section iters
+  // for triplet dims and the original indices for non-section dims.
+  std::string const srcName = traceToDecl(src.getMemref());
+  AccessInfo srcRead;
+  srcRead.array_name = srcName;
+  srcRead.is_read = true;
+  unsigned sectionIdx = 0;
+  for (auto& d : dims) {
+    if (d.isTriplet) {
+      srcRead.index_vars.push_back(iterNames[sectionIdx]);
+      srcRead.index_exprs.push_back(iterNames[sectionIdx]);
+      sectionIdx++;
+    } else {
+      auto nm = resolveIndex(d.index);
+      srcRead.index_vars.push_back(nm.empty() ? "?" : nm);
+      srcRead.index_exprs.push_back(buildIndexExpr(d.index, 0));
+    }
+  }
+
+  // Init assign: target = identity
+  ASTNode init;
+  init.kind = "assign";
+  init.target = tgtName;
+  init.target_is_array = tgtIsArray;
+  init.expr = std::string(identity);
+  init.accesses.push_back(tgtWrite);
+
+  // Accumulate assign: ``target = target <op> src`` for binary ops
+  // (``+``, ``*``, ``or``, ``and``); ``target = fn(target, src)`` for
+  // function-form reductions (``min``, ``max``).  The latter pattern
+  // gives Min/MaxVal section-reduce a tasklet shape that lowers
+  // cleanly to ``std::min`` / ``std::max`` via DaCe's symbolic
+  // codegen.
+  ASTNode acc;
+  acc.kind = "assign";
+  acc.target = tgtName;
+  acc.target_is_array = tgtIsArray;
+  bool const isFnForm = (pyOp == "min" || pyOp == "max");
+  if (isFnForm) {
+    acc.expr = std::string(pyOp) + "(" + tgtName + ", " + srcName + ")";
+  } else {
+    acc.expr = "(" + tgtName + " " + std::string(pyOp) + " " + srcName + ")";
+  }
+  acc.accesses.push_back(tgtWrite);
+  acc.accesses.push_back(tgtRead);
+  acc.accesses.push_back(srcRead);
+
+  // Wrap accumulate in one loop per section dim (outermost first,
+  // matching buildElementalAssign's convention).
+  ASTNode current = acc;
+  int revIdx = (int)sectionRank;
+  for (auto it = dims.rbegin(); it != dims.rend(); ++it) {
+    if (!it->isTriplet) continue;
+    --revIdx;
+    ASTNode wrap;
+    wrap.kind = "loop";
+    wrap.loop_iter = iterNames[revIdx];
+    wrap.loop_lower_expr = buildIndexExpr(it->lo, 0);
+    wrap.loop_bound = buildIndexExpr(it->hi, 0);
+    wrap.children.push_back(current);
+    current = wrap;
+  }
+
+  return {init, current};
+}
+
+}  // namespace hlfir_bridge
