@@ -1,0 +1,118 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dace-fortran"
+version = "1.0.0"
+description = "Fortran (HLFIR) frontend for the DaCe data-centric framework"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+authors = [
+    { name = "ETH Zurich and the dace-fortran authors" }
+]
+requires-python = ">=3.10, <3.15"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Compilers",
+]
+keywords = ["fortran", "flang", "hlfir", "mlir", "dace", "frontend", "dataflow"]
+
+dependencies = [
+    # Pinned to the FaCe branch: it carries the DaCe-core pieces the
+    # frontend needs (``dace.sdfg.construction_utils``, the
+    # Memset/Copy/Count library nodes, the post-cleaning passes).
+    # Switch to ``@main`` once those land upstream.
+    "dace @ git+https://github.com/spcl/dace.git@FaCe",
+    # fparser AST single-TU inliner (dace_fortran.fparser_inliner).  >0.2
+    # carries the Fortran2003-before-Fortran2008 import ordering needed
+    # under Python 3.14 (cf. d-face commit 74110d690).
+    "fparser > 0.2",
+    "networkx",
+    "numpy",
+    # Formatters + git-hook runner are core deps so a plain ``pip install -e .``
+    # makes ``pre-commit run`` (clang-format / yapf / fprettify) work out of the
+    # box.  yapf and clang-format are version-pinned so a local run agrees with the
+    # CI ``format`` job (see .pre-commit-config.yaml, .style.yapf, .clang-format,
+    # .fprettify.rc).
+    "pre-commit",
+    "yapf==0.43.0",
+    "fprettify",
+    "clang-format~=21.1",
+]
+
+[project.optional-dependencies]
+testing = [
+    "pytest",
+    "pytest-cov",
+    "pytest-xdist",
+    "coverage",
+    "numpy",
+    # numpy's f2py uses meson as its build backend on Python >= 3.12; the
+    # numerical-reference builds skip without it (``meson not available``).
+    "meson",
+    "ninja",
+]
+linting = [
+    # Formatters / pre-commit moved to core ``dependencies`` (always available).
+    "flake8",
+]
+dev = [
+    "dace-fortran[testing,linting]",
+]
+
+[project.urls]
+Homepage = "https://github.com/spcl/dace-fortran"
+Repository = "https://github.com/spcl/dace-fortran"
+Documentation = "https://spcldace.readthedocs.io"
+Issues = "https://github.com/spcl/dace-fortran/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dace_fortran*"]
+
+[tool.setuptools.package-data]
+dace_fortran = [
+    "CMakeLists.txt",
+    "build_bridge.py",
+    # Version shims the bridge sources #include; lives at the package root, so it is
+    # not covered by the bridge/ and passes/ globs below.
+    "llvm_compat.h",
+    "bridge/**/*.cpp",
+    "bridge/**/*.h",
+    "passes/**/*.cpp",
+    "passes/**/*.h",
+    # Library runtime sources: CMake compiles these into every SDFG that uses the library, so an
+    # install that drops them fails the build rather than the import.
+    "libraries/**/*.f90",
+    "libraries/**/*.h",
+    "libraries/**/*.cmake",
+    # Binding templates: block_builders.py read_text()s these at runtime; CI never notices a gap
+    # here because it installs -e.
+    "bindings/templates/*.f90.in",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "long: Slow test (e.g. builds ICON from source). CI runs it (CI filters only '-m \"not mpi\"'); routine local full-sweeps exclude it with '-m \"not long\"'.",
+    "sequential: Test must be run sequentially (select with '-m \"sequential\"')",
+    "mpi: Multi-rank MPI test; excluded from the normal sweep, run under mpirun (select with '-m \"mpi\"')",
+    "integration: ICON orig-vs-binding bit-exact integration test (per-call duplicate-data, VERY SHORT run); runs only on the CI 'integration' runner and is excluded from fast/heavy (select with '-m \"integration\"')",
+    "e2e: Production kernel through the full parallelization pipeline (CloudSC, QE vexx, ICON atmosphere velocity_tendencies x2 __LOOP_EXCHANGE variants), built twice on seeded random inputs so pre- vs post-optimize is checked BIT-EXACTLY as well as against the untouched gfortran/f2py reference. Slow (two SDFG builds + -O3 -march=native compiles per kernel); runs only on the CI 'e2e' / 'e2e-cloudsc' runners (select with '-m \"e2e\"')",
+    "xdist_group: pytest-xdist load-group marker (ICON-build tests share one worker via --dist loadgroup)",
+    "fftw: Needs libfftw3 to link the FFT library node's expansion (CI installs libfftw3-dev; select with '-m \"fftw\"')",
+]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+# Don't recurse into the icon-model submodule -- its own scripts/
+# carries an unrelated pytest tree that fails to collect outside
+# its own dependency closure.
+norecursedirs = ["icon-model", ".git", "*.egg-info", "build", ".dacecache*"]
+addopts = "--color=yes"

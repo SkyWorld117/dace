@@ -1,0 +1,146 @@
+"""Bridge hazard-guard coverage: RAW / WAR / WAW sibling assigns.
+
+Several statements in one loop body touching the same array land as separate
+tasklets in one SDFG state with no dataflow edge between them; without a
+hazard guard the codegen scheduler is free to reorder write-before-read
+siblings (cloudsc Section 4.5 bug). The guard (``emit_assign`` for IF bodies,
+``_raw_hazard`` for the loop batch) forces a new state on RAW/WAR/WAW
+collisions. Each kernel is compared against an f2py reference; a reorder
+produces a grossly wrong result, so exact equality is the right assertion.
+"""
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from _util import build_sdfg, f2py_compile, have_flang
+
+pytestmark = pytest.mark.skipif(not have_flang(), reason="no LLVM flang on PATH")
+
+
+def _run(src: str, entry: str, tmp_path: Path, **arrays):
+    """Build ``src`` through the bridge and via f2py; run both.
+    Returns ``(out_sdfg, out_ref)`` dicts of arrays after execution."""
+    name = entry.split("P")[-1]
+    sdfg_dir = tmp_path / "sdfg"
+    sdfg_dir.mkdir(parents=True, exist_ok=True)
+    ref_dir = tmp_path / "ref"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+
+    sdfg = build_sdfg(src, sdfg_dir, name=name, entry=entry).build()
+    sdfg.validate()
+    ref = f2py_compile(src, ref_dir, f"{name}_ref")
+
+    n = next(iter(arrays.values())).shape[0]
+    ref_kw = {k: np.array(v, order="F", copy=True) for k, v in arrays.items()}
+    sdfg_kw = {k: np.array(v, order="F", copy=True) for k, v in arrays.items()}
+
+    getattr(ref, name)(**ref_kw)
+    sdfg(n=np.int32(n), **sdfg_kw)
+    return sdfg_kw, ref_kw
+
+
+def test_raw_sibling_read_after_write(tmp_path: Path):
+    """``t = a*2 ; out = t+1`` -- the second statement reads what the
+    first wrote.  Reordering makes ``out`` read stale ``t``."""
+    src = """
+subroutine raw_kern(n, a, t, out)
+  implicit none
+  integer, intent(in) :: n
+  real(8), intent(in)    :: a(n)
+  real(8), intent(inout) :: t(n)
+  real(8), intent(inout) :: out(n)
+  integer :: i
+  do i = 1, n
+    t(i)   = a(i) * 2.0d0
+    out(i) = t(i) + 1.0d0
+  end do
+end subroutine raw_kern
+"""
+    a = np.arange(1, 9, dtype=np.float64)
+    s, r = _run(src, "raw_kern", tmp_path, a=a, t=np.zeros(8), out=np.zeros(8))
+    np.testing.assert_array_equal(s["out"], r["out"])
+    np.testing.assert_array_equal(s["out"], a * 2.0 + 1.0)
+
+
+def test_war_sibling_write_after_read(tmp_path: Path):
+    """``out = f+1 ; f = a*2`` -- second statement writes what the first read;
+    reordering makes ``out`` read the new ``f`` (cloudsc 4.5 shape)."""
+    src = """
+subroutine war_kern(n, a, f, out)
+  implicit none
+  integer, intent(in) :: n
+  real(8), intent(in)    :: a(n)
+  real(8), intent(inout) :: f(n)
+  real(8), intent(inout) :: out(n)
+  integer :: i
+  do i = 1, n
+    out(i) = f(i) + 1.0d0
+    f(i)   = a(i) * 2.0d0
+  end do
+end subroutine war_kern
+"""
+    a = np.arange(1, 9, dtype=np.float64)
+    f0 = np.full(8, 7.0)
+    s, r = _run(src, "war_kern", tmp_path, a=a, f=f0.copy(), out=np.zeros(8))
+    np.testing.assert_array_equal(s["out"], r["out"])
+    np.testing.assert_array_equal(s["out"], f0 + 1.0)  # old f, not a*2
+    np.testing.assert_array_equal(s["f"], a * 2.0)
+
+
+def test_waw_then_read_final_write_wins(tmp_path: Path):
+    """``x=a ; y=x*3 ; x=b``: ``y`` must use the first write (``a``), final
+    ``x`` is the last write (``b``); a WAW/WAR reorder makes ``y`` read ``b``."""
+    src = """
+subroutine waw_kern(n, a, b, x, y)
+  implicit none
+  integer, intent(in) :: n
+  real(8), intent(in)    :: a(n)
+  real(8), intent(in)    :: b(n)
+  real(8), intent(inout) :: x(n)
+  real(8), intent(inout) :: y(n)
+  integer :: i
+  do i = 1, n
+    x(i) = a(i)
+    y(i) = x(i) * 3.0d0
+    x(i) = b(i)
+  end do
+end subroutine waw_kern
+"""
+    a = np.arange(1, 9, dtype=np.float64)
+    b = np.arange(11, 19, dtype=np.float64)
+    s, r = _run(src, "waw_kern", tmp_path, a=a, b=b, x=np.zeros(8), y=np.zeros(8))
+    np.testing.assert_array_equal(s["y"], r["y"])
+    np.testing.assert_array_equal(s["x"], r["x"])
+    np.testing.assert_array_equal(s["y"], a * 3.0)  # first write of x
+    np.testing.assert_array_equal(s["x"], b)  # last write wins
+
+
+def test_hazard_chain_in_nested_if(tmp_path: Path):
+    """cloudsc-4.5 shape: WAR chain inside a nested IF, exercising the
+    ``emit_assign`` guard; ``cv`` reads ``f`` before it's overwritten."""
+    src = """
+subroutine haz_if(n, a, b, f, cv)
+  implicit none
+  integer, intent(in) :: n
+  real(8), intent(in)    :: a(n)
+  real(8), intent(in)    :: b(n)
+  real(8), intent(inout) :: f(n)
+  real(8), intent(inout) :: cv(n)
+  integer :: i, p
+  do p = 1, 2
+    do i = 1, n
+      if (a(i) > 0.0d0) then
+        cv(i) = cv(i) + f(i) * b(i)
+        f(i)  = f(i) - a(i)
+      end if
+    end do
+  end do
+end subroutine haz_if
+"""
+    a = np.arange(1, 9, dtype=np.float64)
+    b = np.full(8, 0.5)
+    s, r = _run(src, "haz_if", tmp_path, a=a, b=b, f=np.full(8, 10.0), cv=np.zeros(8))
+    np.testing.assert_array_equal(s["cv"], r["cv"])
+    np.testing.assert_array_equal(s["f"], r["f"])
