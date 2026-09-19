@@ -363,6 +363,20 @@ class InlineSDFG(transformation.SingleStateTransformation):
     def apply(self, state: SDFGState, sdfg: SDFG):
         nsdfg_node = self.nested_sdfg
         nsdfg: SDFG = nsdfg_node.sdfg
+        # `can_be_applied` is NOT re-checked by the transformation machinery, so a caller that
+        # applies this directly -- a pass that forces past the check, or any hand-written fixup --
+        # arrives here having verified nothing.  The two STRUCTURAL preconditions are therefore
+        # asserted rather than assumed: this is the SINGLE-state inliner, and `nstate` below takes
+        # `nodes()[0]`.  On a multi-state nested SDFG that silently produces a WRONG SDFG instead of
+        # raising -- which is exactly how applying this transformation library-wide turned a working
+        # program into one that produced NaN at step 1.
+        if len(nsdfg.nodes()) != 1 or not isinstance(nsdfg.nodes()[0], SDFGState):
+            raise ValueError(
+                f'InlineSDFG is the single-state inliner, but {nsdfg_node.label!r} contains '
+                f'{len(nsdfg.nodes())} state(s).  Inlining it would silently discard all but the '
+                f'first; use InlineMultistateSDFG for a multi-state nested SDFG.')
+        if nsdfg_node.no_inline:
+            raise ValueError(f'{nsdfg_node.label!r} is marked no_inline and must not be inlined.')
         nstate: SDFGState = nsdfg.nodes()[0]
 
         nsdfg_scope_entry = state.entry_node(nsdfg_node)
