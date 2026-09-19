@@ -38,6 +38,17 @@ class MapCollapse(transformation.SingleStateTransformation):
         WHAT TO DO ABOUT IT: write the pair as one nest over the union of their ranges, each arm
         guarded by its own bound.  That lowers to a single fully-collapsed map -- and it is the form
         the loop nest should arguably have had in the first place.
+
+        WHY THERE IS NO AUTOMATIC FUSION FOR THIS, and it is not a matter of effort.  Fusing the two
+        arms requires their UNION, and for symbolically-bounded ranges that means deciding relations
+        between the arms' bound symbols -- e.g. the arms `ulb:c_hi` and `c_lo:ure` union to
+        `c_lo:c_hi` only if `ulb >= c_lo` and `ure <= c_hi`.  **The SDFG records no such relation**:
+        the symbols are free, and `sympy` cannot decide them (nor is there a `Range.union` to call).
+        So the information a fusion would need is simply not present at the SDFG level -- it lives
+        with whoever wrote the loops, which is why the answer is a source-level rewrite and not a
+        pass.  A pass could only fuse ranges that are provably co-extensive, which is the case
+        :func:`find_parameter_remapping <dace.transformation.dataflow.map_fusion_helper.find_parameter_remapping>`
+        already accepts.
     """
 
     outer_map_entry = transformation.PatternNode(nodes.MapEntry)
