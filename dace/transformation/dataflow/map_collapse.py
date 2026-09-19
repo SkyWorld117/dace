@@ -123,3 +123,41 @@ class MapCollapse(transformation.SingleStateTransformation):
         outer_map_exit = graph.exit_node(outer_map_entry)
 
         return sdutil.merge_maps(graph, outer_map_entry, outer_map_exit, inner_map_entry, inner_map_exit)
+
+
+def uncoalesced_device_maps(sdfg):
+    """Device Maps whose body holds SIBLING Maps -- i.e. the collapse that did not happen.
+
+    THE SIGNATURE.  When a Map's body contains two Maps side by side, neither chain can collapse (it
+    would have to duplicate the enclosing Map), so the enclosing Map keeps its own dimensionality
+    alone and the inner loops run serially inside each thread.  On a device that puts the unit-stride
+    dimension OFF the block axis, and the kernel is uncoalesced.  The arithmetic is right, so nothing
+    fails -- it is simply slow, by a factor measured at 372x on a real kernel (2.0 ms/launch against
+    5.4 us).
+
+    This is deliberately a SEPARATE function rather than a condition inside the transformation: a
+    transformation that silently declines is the thing that made this expensive to find in the first
+    place, and a caller that wants to be told should be able to ask.
+
+    Note what this does NOT rely on: whether the two sibling Maps' iteration spaces could be
+    remapped onto each other.  They usually cannot -- `find_parameter_remapping` refuses, correctly,
+    because the arms of a stencil differ by an offset -- and an earlier version of this check that
+    filtered on that returned a clean bill of health for a Map that was in fact uncoalesced.
+
+    :returns: ``[(outer_map_entry, [sibling_map_entries])]``, empty when every device Map collapsed.
+    """
+    from dace.dtypes import ScheduleType      # deferred: see the note above
+    out = []
+    for state in sdfg.all_states():
+        for node in state.nodes():
+            if not isinstance(node, nodes.MapEntry):
+                continue
+            if node.map.schedule != ScheduleType.GPU_Device:
+                continue
+            siblings = [
+                n for n in state.nodes()
+                if isinstance(n, nodes.MapEntry) and state.entry_node(n) is node
+            ]
+            if len(siblings) > 1:
+                out.append((node, siblings))
+    return out
