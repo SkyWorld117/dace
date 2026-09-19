@@ -17,6 +17,27 @@ class MapCollapse(transformation.SingleStateTransformation):
 
         Map-collapse takes two nested maps with M and N dimensions respectively,
         and collapses them to a single M+N dimensional map.
+
+        IT FUSES A CHAIN, NOT SIBLINGS, and the consequence is easy to miss because it shows up as
+        SLOWNESS rather than as an error.  When a map's body holds two maps side by side, neither
+        chain can be collapsed -- collapsing one would have to duplicate the enclosing map -- so the
+        enclosing map stays M-dimensional and the inner loops run SERIALLY inside each thread.  On a
+        GPU that is the difference between the unit-stride dimension being spread across the block
+        and being walked one step at a time.
+
+        Measured on a stencil pair written the way the source usually writes it, one loop per arm:
+        the enclosing map covered the outer loop alone, and the kernel cost **2.0 ms per launch
+        against 5.4 us** for the fused form -- 372x, and 81.6% of a run's GPU time against 1.2%.
+        Nothing warns; the arithmetic is right.
+
+        The two arms cannot simply be fused either: their iteration spaces genuinely differ (they are
+        the same stencil at different offsets), so :func:`find_parameter_remapping
+        <dace.transformation.dataflow.map_fusion_helper.find_parameter_remapping>` correctly refuses,
+        and a correct fusion needs the UNION of the ranges with each arm behind a guard.
+
+        WHAT TO DO ABOUT IT: write the pair as one nest over the union of their ranges, each arm
+        guarded by its own bound.  That lowers to a single fully-collapsed map -- and it is the form
+        the loop nest should arguably have had in the first place.
     """
 
     outer_map_entry = transformation.PatternNode(nodes.MapEntry)
