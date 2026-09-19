@@ -183,3 +183,132 @@ def uncoalesced_device_maps(sdfg):
             if len(siblings) > 1:
                 out.append((node, siblings))
     return out
+
+
+def _child_writes(state, child_entry):
+    """The data a Map's child scope writes, resolved through the scope's MapExits.
+
+    NOT sink AccessNodes inside the child -- the children of one of these Maps hold ONLY tasklets and
+    a MapExit, with the arrays at the enclosing Map's level, so that scan finds nothing and refuses
+    every split.  NOT a fixed number of hops from the tasklet either -- that reported the same array
+    for both children.  `memlet_path` resolves the whole chain.
+    """
+    written = set()
+    for node in state.nodes():
+        if not isinstance(node, nodes.Tasklet) or state.entry_node(node) is not child_entry:
+            continue
+        for e in state.out_edges(node):
+            path = state.memlet_path(e)
+            if path and isinstance(path[-1].dst, nodes.AccessNode):
+                written.add(path[-1].dst.data)
+    return written
+
+
+def _children_write_disjointly(state, kids):
+    """Conservative independence check: no two children write the same data.
+
+    Splitting `for i { A; B }` into `for i { A }` and `for i { B }` is equivalent only when they are
+    independent.  DISJOINT WRITES suffices: two children writing different arrays, sharing only reads,
+    cannot observe each other through the split.  Conservative on purpose -- a child whose writes
+    cannot be determined, or that writes nothing, counts as overlapping.
+    """
+    seen = set()
+    for kid in kids:
+        w = _child_writes(state, kid)
+        if not w or w & seen:
+            return False
+        seen |= w
+    return True
+
+
+def _prune_unused_connectors(state, node):
+    """Drop connector DECLARATIONS that no edge uses.
+
+    A cloned MapEntry/MapExit is a deep copy, so it inherits every connector the original declared --
+    including the ones that belonged to the child left behind.  Those have no edges and the validator
+    reports each as a dangling connector.  A name is dropped only when neither it nor its PAIR is
+    attached: the validator requires `IN_n` and `OUT_n` to be present together, so pruning one of a
+    live pair just moves the error to the other side.
+    """
+    ins = {e.dst_conn for e in state.in_edges(node) if e.dst_conn}
+    outs = {e.src_conn for e in state.out_edges(node) if e.src_conn}
+    for c in list(getattr(node, "in_connectors", ())):
+        if c not in ins and f"OUT_{c[3:]}" not in outs:
+            node.remove_in_connector(c)
+    for c in list(getattr(node, "out_connectors", ())):
+        if c not in outs and f"IN_{c[4:]}" not in getattr(node, "in_connectors", ()):
+            node.remove_out_connector(c)
+
+
+def split_sibling_maps(sdfg) -> int:
+    """Give each child of a multi-child Map its own copy of that Map, so the chains can collapse.
+
+    WHY.  :class:`MapCollapse` fuses a CHAIN and refuses when the outer MapEntry has more than one
+    outgoing edge -- exactly what a stencil pair written one-loop-per-arm produces.  Neither chain
+    collapses, the enclosing Map keeps its own dimensionality alone, the inner loops run serially per
+    thread, and the kernel is uncoalesced: measured at 372x on a real kernel (2.0 ms/launch against
+    5.4 us), with nothing failing and nothing warning.
+
+    WHAT IT DOES.  The first child stays where it is; every other child gets a CLONE of the enclosing
+    Map.  Each copy then has one child, MapCollapse fuses each chain, and the result is N
+    fully-dimensional Maps instead of one starved one.
+
+    NO UNION IS NEEDED, and therefore no knowledge of how the arms' bounds relate -- which is what
+    makes the union route impossible (see this class's note).  Splitting works precisely because it
+    never has to know what the two ranges have in common.
+
+    THE BOUNDARY TRAVELS WITH THE CHILD, AND IT IS NOT JUST THE TWO OBVIOUS EDGES.  A child's scope has
+    four, and missing any of them leaves an SDFG that fails to validate:
+      * the child's own in-edges move to the clone's entry;
+      * the child's exit's out-edges move to the clone's exit;
+      * the clone's entry needs the ORIGINAL entry's in-edges (`IN_n`), which its body's `OUT_n`
+        connectors pair with -- a cloned entry arrives with none, and the body then has no symbols;
+      * the `OUT_n` group that carries the child's RESULTS moves to the clone's exit.  Leaving it
+        behind is not obviously wrong -- the results still reach their sinks -- but the original exit
+        keeps `OUT_n` for a child that is no longer inside it, so its `IN_n` group no longer matches;
+      * and both node pairs then need their unused connector DECLARATIONS pruned.
+    Each omission shows up as a different validator message (`Dangling in-connector`, `No match for
+    output connector`) or as a `StopIteration` from `memlet_path` deep inside `merge_maps`.
+
+    :returns: the number of Maps cloned.
+    """
+    import copy
+
+    from dace.transformation import helpers as xfhelpers
+
+    cloned = 0
+    for state in sdfg.all_states():
+        for outer in list(state.nodes()):
+            if not isinstance(outer, nodes.MapEntry):
+                continue
+            kids = [n for n in state.nodes()
+                    if isinstance(n, nodes.MapEntry) and state.entry_node(n) is outer]
+            if len(kids) < 2 or not _children_write_disjointly(state, kids):
+                continue
+            outer_exit = state.exit_node(outer)
+            entry_ins = list(state.in_edges(outer))
+            for kid in kids[1:]:
+                kid_exit = state.exit_node(kid)
+                new_entry = copy.deepcopy(outer)
+                new_exit = copy.deepcopy(outer_exit)
+                state.add_node(new_entry)
+                state.add_node(new_exit)
+
+                in_edges = [e for e in state.in_edges(kid) if e.src is outer]
+                out_edges = [e for e in state.out_edges(kid_exit) if e.dst is outer_exit]
+                moving_outs = [
+                    e for e in state.out_edges(outer_exit)
+                    if e.src_conn in {x.dst_conn.replace("IN_", "OUT_") for x in out_edges}
+                ]
+                for e in in_edges:
+                    xfhelpers.redirect_edge(state=state, edge=e, new_src=new_entry)
+                for e in out_edges:
+                    xfhelpers.redirect_edge(state=state, edge=e, new_dst=new_exit)
+                for e in moving_outs:
+                    xfhelpers.redirect_edge(state=state, edge=e, new_src=new_exit)
+                for e in entry_ins:
+                    state.add_edge(e.src, e.src_conn, new_entry, e.dst_conn, copy.deepcopy(e.data))
+                for node in (outer, new_entry, new_exit, outer_exit):
+                    _prune_unused_connectors(state, node)
+                cloned += 1
+    return cloned
