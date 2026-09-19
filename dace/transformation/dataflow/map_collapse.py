@@ -39,7 +39,8 @@ class MapCollapse(transformation.SingleStateTransformation):
         guarded by its own bound.  That lowers to a single fully-collapsed map -- and it is the form
         the loop nest should arguably have had in the first place.
 
-        WHY THERE IS NO AUTOMATIC FUSION FOR THIS, and it is not a matter of effort.  Fusing the two
+        WHY THE OBVIOUS AUTOMATIC FUSION DOES NOT WORK (the UNION route -- see the note at the end
+        for the route that is NOT ruled out).  Fusing the two
         arms requires their UNION, and for symbolically-bounded ranges that means deciding relations
         between the arms' bound symbols -- e.g. the arms `ulb:c_hi` and `c_lo:ure` union to
         `c_lo:c_hi` only if `ulb >= c_lo` and `ure <= c_hi`.  **The SDFG records no such relation**:
@@ -49,6 +50,16 @@ class MapCollapse(transformation.SingleStateTransformation):
         pass.  A pass could only fuse ranges that are provably co-extensive, which is the case
         :func:`find_parameter_remapping <dace.transformation.dataflow.map_fusion_helper.find_parameter_remapping>`
         already accepts.
+
+        NOT RULED OUT: splitting instead of unioning.  A fusion is not the only way to coalesce --
+        CLONING the enclosing map, one copy per child, would let each chain collapse on its own, and
+        it needs no union and no knowledge of how the arms' bounds relate.  It is sound only when the
+        two children are independent (here they write disjoint arrays), which is a checkable
+        condition.  It is recorded here as untested rather than recommended: it was not implemented,
+        and the experiments that were meant to validate it were both methodologically flawed -- a
+        crude node deletion left the SDFG invalid, and a synthetic two-map SDFG did not reproduce the
+        pattern MapCollapse matches.  So the statement above is scoped to the union route, and this
+        one is a lead that has NOT been disproved.
     """
 
     outer_map_entry = transformation.PatternNode(nodes.MapEntry)
