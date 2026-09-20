@@ -141,17 +141,37 @@ def describe(sdfg) -> Dict[str, Any]:
     }
 
 
-def write(sdfg, out_dir, name: Optional[str] = None) -> Path:
+def write(sdfg, out_dir, name: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Path:
     """Write ``<name>.abi.json`` next to a compiled library.
 
     Additive by design: DaCe's older argument-list artefacts are not touched, because they have
     readers.
+
+    ``extra`` is the seam for the parts of an ABI that are the CALLER's knowledge and not the
+    graph's -- in particular which expression at the call site each argument binds to.  It is
+    deliberately a parameter rather than a built-in: `describe` reads the SDFG, so everything it
+    reports is true of ANY compiled SDFG, while a binding says "this dummy is MFC's
+    `dqL_prim_dx_n(1)%vf(iv%beg + 0)%sf`", which is a fact about one project.  A repository that
+    knew that would be a general tool with one project's data model inside it.
+
+    `extra` may not shadow a key `describe` produced: two descriptions of the same argument that
+    disagree is exactly the kind of thing that is read as agreeing, and the graph's answer wins in
+    the sense of being the one that cannot be stale.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     name = name or sdfg.name
+    doc = describe(sdfg)
+    if extra:
+        clash = sorted(set(extra) & set(doc))
+        if clash:
+            raise ValueError(
+                f"manifest: `extra` would overwrite {clash}, which `describe()` derives from the "
+                f"SDFG.  A caller-supplied description that disagrees with the graph is worse than "
+                f"no description -- put it under its own key.")
+        doc = {**doc, **extra}
     path = out_dir / f"{name}.abi.json"
-    path.write_text(json.dumps(describe(sdfg), indent=1, sort_keys=False) + "\n")
+    path.write_text(json.dumps(doc, indent=1, sort_keys=False) + "\n")
     return path
 
 
