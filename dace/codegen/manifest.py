@@ -72,7 +72,12 @@ def _intents(sdfg) -> Dict[str, str]:
 
 def describe(sdfg) -> Dict[str, Any]:
     """The library's ABI as data: argument order, and for each, its kind/dtype/rank/shape/intent."""
-    arglist = [str(a) for a in sdfg.arglist()]
+    # KEEP THE DESCRIPTORS, not just their names.  `arglist()` hands back a `dt.Data` per argument --
+    # for a free symbol, `dt.Scalar(sdfg.symbols[name])`, carrying its dtype -- and taking only
+    # `str(a)` threw that away, which is why the symbol branch below used to record "unknown" for a
+    # fact it had been given.  See the note there.
+    descriptors = sdfg.arglist()
+    arglist = [str(a) for a in descriptors]
 
     # Split the flat list into arrays and scalars, and collect each array's extent arguments.  The
     # extents follow their array in the arglist, but the association is by NAME, not position, so a
@@ -128,8 +133,24 @@ def describe(sdfg) -> Dict[str, Any]:
                 "is_view": isinstance(desc, dt.View),
             })
             continue
-        # Not in `arrays` at all: a symbol, not a buffer.
-        args.append({"index": i, "name": name, "kind": "symbol", "dtype": "unknown"})
+        # Not in `arrays` at all: a symbol, not a buffer.  It is still a real parameter of the
+        # generated C function -- symbols reach the ABI with a concrete scalar type -- so record the
+        # type `arglist()` gave us rather than "unknown".
+        #
+        # WHY THIS IS NOT PEDANTRY.  A binding that declares the C signature has to write a Fortran
+        # type per argument, and "unknown" is not one: the consumer of this manifest, a Fortran port
+        # of a CFD solver, could only work around it with a hardcoded list of the six loop-bound
+        # names (`jb`, `je`, `kb`, `ke`, `lb`, `le`) that its kernels happen to use.  MEASURED in the
+        # generated C for one of its libraries: those six are `int jb, int je, ...`, and the hardcoded
+        # list asserted exactly that.  A seventh symbol, or a rename, would have fallen through to a
+        # silent default instead.  The information was here the whole time.
+        sdesc = descriptors.get(name)
+        args.append({
+            "index": i,
+            "name": name,
+            "kind": "symbol",
+            "dtype": str(sdesc.dtype) if isinstance(sdesc, dt.Data) else "unknown",
+        })
 
     return {
         "name": sdfg.name,
