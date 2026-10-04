@@ -1212,11 +1212,27 @@ class fortran_mod(sympy.Function):
         return self.args[0].is_integer and self.args[1].is_integer
 
 
+#
+# A concrete literal argument is folded to the value the cast produces (a C
+# truncating cast for the integer kinds, REAL(4) narrowing for ``float32``).
+# Without this, a numeric-argument cast stays an unevaluated ``Function`` whose
+# ``is_comparable`` is False, and ``sympy.Max``/``Min`` then reject it:
+# ``max(tke_1d[get_pblh_k-1], float32(0.0))`` raises
+# ``ValueError: The argument 'float32(0.0)' is not comparable``.  Measured on
+# the WRF YSU slice, that ValueError aborted the whole ``ScalarToSymbolPass``
+# (via ``InterstateEdge.new_symbols`` in ``remove_symbol_indirection``).
+# Symbolic arguments are left as the cast, so the ``dace::<type>(x)`` C++ cast
+# and the round-trip in ``typecast_symbolic_test`` are unchanged.
 class int32(sympy.Function):
     """Explicit ``INTEGER(4)`` typecast in a symbolic expression (interstate edge /
     memlet subset), where ``dace.int32(x)`` is not sympy-parseable as an attribute
     call. Prints as the truncating ``dace::int32(x)`` C++ cast."""
     nargs = 1
+
+    @classmethod
+    def eval(cls, x):
+        if x.is_Number:
+            return sympy.Integer(int(x))
 
     def _eval_is_integer(self):
         return True
@@ -1226,6 +1242,11 @@ class int64(sympy.Function):
     """Explicit ``INTEGER(8)`` typecast -- see :class:`int32`."""
     nargs = 1
 
+    @classmethod
+    def eval(cls, x):
+        if x.is_Number:
+            return sympy.Integer(int(x))
+
     def _eval_is_integer(self):
         return True
 
@@ -1234,6 +1255,12 @@ class float32(sympy.Function):
     """Explicit ``REAL(4)`` typecast -- see :class:`int32`."""
     nargs = 1
 
+    @classmethod
+    def eval(cls, x):
+        if x.is_Number:
+            # Narrow to REAL(4), then widen, so the folded value equals the cast.
+            return sympy.Float(float(numpy.float32(float(x))))
+
     def _eval_is_real(self):
         return True
 
@@ -1241,6 +1268,11 @@ class float32(sympy.Function):
 class float64(sympy.Function):
     """Explicit ``REAL(8)`` typecast -- see :class:`int32`."""
     nargs = 1
+
+    @classmethod
+    def eval(cls, x):
+        if x.is_Number:
+            return sympy.Float(float(x))
 
     def _eval_is_real(self):
         return True
