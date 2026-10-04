@@ -897,7 +897,12 @@ class CPPUnparser:
                         self.write(f", {power})")
                     self.write(")")
                     return
-                elif power is not None and float(power) == 0.5 or float(power) == -0.5:  # Square root
+                # NOTE: the parentheses are load-bearing.  With the previous `A and B or C` grouping,
+                # a non-constant exponent (``power is None``, e.g. an fparser ``x ** (-a*b)`` whose
+                # right side is ``UnaryOp(USub, BinOp(...))``) evaluated ``float(None)`` and raised
+                # TypeError during codegen.  Guarding the whole comparison keeps such exponents on the
+                # general ``dace::math::pow`` path below.
+                elif power is not None and (float(power) == 0.5 or float(power) == -0.5):  # Square root
                     if float(power) == -0.5:
                         # rsqrt
                         self.write("reciprocal(")

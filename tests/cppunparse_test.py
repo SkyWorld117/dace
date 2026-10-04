@@ -117,6 +117,28 @@ if (something) {
     assert success
 
 
+def test_pow_nonconstant_exponent():
+    """Regression: a `Pow` whose exponent is a non-constant unary-minus expression must not crash.
+
+    fparser lowers Fortran ``x ** (-a*b)`` to ``UnaryOp(USub, BinOp(...))`` on the right of the
+    ``Pow``.  ``_BinOp`` then leaves ``power = None``; the old ``A and B or C`` grouping evaluated
+    ``float(None)`` and raised ``TypeError`` before reaching the general-pow fallback.  The fix
+    guards the whole comparison, so such an exponent emits valid C via ``dace::math::pow``.
+    Revert the fix -> this test raises ``TypeError`` on the first expression.
+    """
+    # Equivalent Python AST: `x ** -y` parses with right = UnaryOp(USub, Name('y')).
+    assert cppunparse.pyexpr2cpp("x ** -y") == "dace::math::pow(x, (- y))"
+    assert cppunparse.pyexpr2cpp("10.0 ** -y") == "dace::math::pow(10.0, (- y))"
+    assert cppunparse.pyexpr2cpp("x ** -(a*b)") == "dace::math::pow(x, (- (a * b)))"
+
+    # The literal special cases (ipow / sqrt / rsqrt) must be unchanged.
+    assert cppunparse.pyexpr2cpp("x ** 2") == "(dace::math::ipow(x, 2))"
+    assert cppunparse.pyexpr2cpp("x ** -2") == "reciprocal(dace::math::ipow(x, 2))"
+    assert cppunparse.pyexpr2cpp("x ** 0.5") == "dace::math::sqrt(x)"
+    assert cppunparse.pyexpr2cpp("x ** -0.5") == "reciprocal(dace::math::sqrt(x))"
+
+
 if __name__ == "__main__":
     test()
     test_annotated_definition()
+    test_pow_nonconstant_exponent()
