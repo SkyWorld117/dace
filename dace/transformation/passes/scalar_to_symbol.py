@@ -191,6 +191,20 @@ def find_promotable_scalars(sdfg: sd.SDFG, transients_only: bool = True, integer
                     if (tinput.data.dynamic or tinput.data.subset.num_elements() != 1):
                         candidates.remove(candidate)
                         break
+                    # An ARRAY input read at a NON-CONSTANT subscript is not a
+                    # valid symbol value: the defining tasklet's connector would
+                    # become ``arr[<loop iter or symbol>]`` in the promoted
+                    # symbol's assignment, and a later pass (ConstantPropagation)
+                    # folds that subscript-bearing expression into consumer
+                    # tasklets that have no connector for ``arr`` -- emitting a
+                    # raw ``arr[i, j]`` (invalid C++ ``std::make_tuple`` when the
+                    # array is multidimensional). A CONSTANT-index read
+                    # (``j = A[1, 1]``) is loop-invariant and stays promotable,
+                    # which is the intended "may have array inputs" case.
+                    if (not isinstance(sdfg.arrays[tinput.src.data], dt.Scalar)
+                            and len(tinput.data.subset.free_symbols) > 0):
+                        candidates.remove(candidate)
+                        break
                     # If input array has inputs of its own (cannot promote within same state), skip
                     if state.in_degree(tinput.src) > 0:
                         candidates.remove(candidate)

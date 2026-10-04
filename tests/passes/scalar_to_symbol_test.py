@@ -783,6 +783,45 @@ def test_scalar_index_regression(memlet_volume_n):
     assert np.allclose(a, ref)
 
 
+@pytest.mark.parametrize('idx, promotable', [('i', False), ('1', True)])
+def test_array_read_nonconstant_subscript(idx, promotable):
+    """A scalar defined from an array read at a NON-CONSTANT subscript is NOT promotable.
+
+    The promoted symbol's value would be that array subscript (carrying its loop
+    iterator or a runtime symbol) -- not a valid symbol expression. A later pass
+    (ConstantPropagation) then folds the subscript-bearing value into consumer
+    tasklets that have no connector for the array, emitting a raw ``A[i]``
+    (invalid C++ ``std::make_tuple`` for a multidimensional array). Measured on
+    the WRF sfclay slice: ``zol20 = zol2 * znt(i, j) / za(i, j)`` was promoted and
+    the raw ``znt[i, j]`` reached cppunparse. A CONSTANT-index read
+    (``j = A[1]``/``A[1, 1]``, see ``test_promote_array_assignment``) is
+    loop-invariant and stays promotable.
+    """
+    sdfg = dace.SDFG('t')
+    sdfg.add_symbol('i', dace.int64)
+    sdfg.add_array('A', [20], dace.int64)
+    sdfg.add_scalar('s', dace.int64, transient=True)
+    sdfg.add_array('B', [20], dace.int64)
+
+    s1 = sdfg.add_state()
+    ra = s1.add_read('A')
+    ws = s1.add_write('s')
+    t = s1.add_tasklet('rd', {'inp'}, {'out'}, 'out = inp')
+    s1.add_edge(ra, None, t, 'inp', dace.Memlet('A[%s]' % idx))
+    s1.add_edge(t, 'out', ws, None, dace.Memlet('s'))
+
+    s2 = sdfg.add_state_after(s1)
+    rs = s2.add_read('s')
+    rb = s2.add_write('B')
+    t2 = s2.add_tasklet('wr', {'x'}, {'y'}, 'y = x')
+    s2.add_edge(rs, None, t2, 'x', dace.Memlet('s'))
+    s2.add_edge(t2, 'y', rb, None, dace.Memlet('B[0]'))
+
+    sdfg.validate()
+    got = scalar_to_symbol.find_promotable_scalars(sdfg)
+    assert ('s' in got) == promotable, got
+
+
 if __name__ == '__main__':
     test_find_promotable()
     test_promote_simple()
