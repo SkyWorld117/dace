@@ -1000,6 +1000,21 @@ class CPPUnparser:
         'float64': 'dace::float64',
         're': 'dace::math::re',
         'im': 'dace::math::im',
+        # Transcendental intrinsics the Fortran frontend emits as BARE names
+        # (``dace-fortran`` bridge/ast/expressions.cpp ``unary_math``).  Emitted
+        # verbatim they bind to the C ``::log``/``::exp``/... (DOUBLE), so a
+        # float32 argument is computed in double and narrowed -- one ULP off
+        # from the ``logf``/``expf``/... a Fortran compiler emits.  Each
+        # ``dace::math::X`` here has a float overload (``std::X(float)`` ->
+        # ``Xf``), matching the reference.  Scale-invariant kernels never
+        # notice; an ill-conditioned one does (WRF sfclay's zolri secant
+        # amplifies the log/exp 1 ULP to ~1e-3 in ``zol``).
+        'sin': 'dace::math::sin', 'cos': 'dace::math::cos', 'tan': 'dace::math::tan',
+        'asin': 'dace::math::asin', 'acos': 'dace::math::acos', 'atan': 'dace::math::atan',
+        'atan2': 'dace::math::atan2', 'sinh': 'dace::math::sinh', 'cosh': 'dace::math::cosh',
+        'tanh': 'dace::math::tanh', 'exp': 'dace::math::exp', 'log': 'dace::math::log',
+        'log10': 'dace::math::log10', 'sqrt': 'dace::math::sqrt', 'erf': 'dace::math::erf',
+        'erfc': 'dace::math::erfc',
     }
 
     def _Call(self, t: ast.Call):
