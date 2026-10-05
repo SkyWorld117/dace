@@ -522,6 +522,26 @@ def result_type_of(lhs, *rhs):
     # Extract the numpy type so we can call issubdtype on them
     lhs_ = lhs.type if isinstance(lhs, typeclass) else lhs
     rhs_ = rhs.type if isinstance(rhs, typeclass) else rhs
+
+    # Resolve ``bool`` BEFORE the size extraction below. A Python bool constant infers
+    # ``dtypes.typeclass(bool)``, whose ``.type`` is the BUILTIN ``bool``: ``bool(0)`` is ``False``
+    # and has no ``.itemsize``, so ``size_lhs = lhs_(0).itemsize`` raises. Reached by a promoted
+    # scalar whose defining tasklet is ``_out = <bool> if <cond> else <number>`` (WRF GF cloud-top
+    # flags). numpy's rule: a bool paired with a numeric type yields that numeric type; two bools
+    # yield bool.
+    def _is_bool_type(t):
+        if t is bool:
+            return True
+        try:
+            return numpy.dtype(t).kind == 'b'
+        except (TypeError, ValueError):
+            return False
+
+    lhs_bool, rhs_bool = _is_bool_type(lhs_), _is_bool_type(rhs_)
+    if lhs_bool or rhs_bool:
+        if lhs_bool and rhs_bool:
+            return lhs
+        return rhs if lhs_bool else lhs
     # Extract data sizes (seems the type itself doesn't expose this)
     size_lhs = lhs_(0).itemsize
     size_rhs = rhs_(0).itemsize

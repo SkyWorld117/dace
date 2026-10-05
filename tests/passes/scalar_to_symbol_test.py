@@ -8,6 +8,7 @@ from dace.transformation import interstate as isxf
 from sympy import core as sympy_core
 import numpy as np
 import pytest
+import re
 
 
 def test_find_promotable():
@@ -820,6 +821,62 @@ def test_array_read_nonconstant_subscript(idx, promotable):
     sdfg.validate()
     got = scalar_to_symbol.find_promotable_scalars(sdfg)
     assert ('s' in got) == promotable, got
+
+
+def test_scalar_dependency_not_promotable():
+    """A scalar defined from another scalar that is itself array-derived is NOT promotable.
+
+    WRF Grell-Freitas shape: a break flag ``flag`` is defined by a tasklet that reads the Scalar
+    ``denom``; ``denom`` reads arrays at a NON-CONSTANT subscript, so it cannot become a symbol.
+    ``ScalarToSymbolPromotion`` step 2 appends a subscript only for non-Scalar containers, so
+    promoting ``flag`` inlines ``denom``'s bare name onto the inter-state edge. The symbolic layer
+    then either resolves it to a sympy builtin (``denom`` -> ``sympy.denom``) and raises, or leaves
+    a free symbol nothing defines. Contrast ``test_promote_simple_c``, where ``i`` reads the
+    non-symbol Scalar ``j`` for an *incidental* reason (``j`` is written by the tasklet that reads
+    it) and the promotion is still legitimate -- the rejection must be narrow.
+    """
+    sdfg = dace.SDFG('gf_shape')
+    sdfg.add_symbol('al', dace.int32)
+    sdfg.add_symbol('i', dace.int64)
+    sdfg.add_array('A', [20], dace.float32)
+    sdfg.add_scalar('denom', dace.float32, transient=True)
+    sdfg.add_scalar('flag', dace.int32, transient=True)
+    B = sdfg.add_array('B', [1], dace.int32)
+
+    # denom = A[i] -- array read at a non-constant subscript, so denom is non-promotable.
+    s1 = sdfg.add_state()
+    ra = s1.add_read('A')
+    wd = s1.add_write('denom')
+    t1 = s1.add_tasklet('mkden', {'inp'}, {'out'}, 'out = inp + 1')
+    s1.add_edge(ra, None, t1, 'inp', dace.Memlet('A[i]'))
+    s1.add_edge(t1, 'out', wd, None, dace.Memlet('denom'))
+
+    # flag = ((not (denom < 1e-8)) if (al > 0) else 0) -- reads the non-promotable Scalar denom.
+    s2 = sdfg.add_state_after(s1)
+    rd = s2.add_read('denom')
+    wf = s2.add_write('flag')
+    t2 = s2.add_tasklet('mkflag', {'d'}, {'out'}, 'out = ((not (d < 1e-8)) if (al > 0) else 0)')
+    s2.add_edge(rd, None, t2, 'd', dace.Memlet('denom'))
+    s2.add_edge(t2, 'out', wf, None, dace.Memlet('flag'))
+
+    s3 = sdfg.add_state_after(s2)
+    rf = s3.add_read('flag')
+    wb = s3.add_write('B')
+    t3 = s3.add_tasklet('use', {'x'}, {'y'}, 'y = x')
+    s3.add_edge(rf, None, t3, 'x', dace.Memlet('flag'))
+    s3.add_edge(t3, 'y', wb, None, dace.Memlet('B[0]'))
+
+    sdfg.validate()
+    got = scalar_to_symbol.find_promotable_scalars(sdfg)
+    assert 'flag' not in got, got
+    assert 'denom' not in got, got
+
+    # The pass must complete and leave a valid SDFG with no bare ``denom`` reaching an edge.
+    scalar_to_symbol.ScalarToSymbolPromotion().apply_pass(sdfg, {})
+    sdfg.validate()
+    for edge in sdfg.all_interstate_edges():
+        for rhs in edge.data.assignments.values():
+            assert not re.search(r'\bdenom\b', rhs), rhs
 
 
 if __name__ == '__main__':

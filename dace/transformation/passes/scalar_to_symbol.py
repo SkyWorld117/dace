@@ -59,6 +59,48 @@ class RemoveConstantAttributes(ast.NodeTransformer):
         return self.generic_visit(node)
 
 
+def _scalar_definition_dependencies(sdfg: sd.SDFG) -> Tuple[Set[str], Dict[str, Set[str]]]:
+    """Classify every ``Scalar`` written in a state by how its definition is built.
+
+    Returns ``(array_derived, deps)``:
+
+    * ``array_derived`` -- Scalars whose defining tasklet reads an *array* at a NON-CONSTANT
+      subscript. That is the substantive reason such a Scalar cannot become a symbol: its value
+      is a runtime array element, not a symbolic expression. (:func:`find_promotable_scalars`
+      already rejects these as candidates; they are collected here independently because a
+      *different* candidate may depend on one.)
+    * ``deps`` -- for each written Scalar, the Scalar names its definition reads directly, whether
+      through a tasklet connector or a direct AccessNode-to-AccessNode copy.
+
+    The two together let a candidate be rejected when inlining it would drag a runtime Scalar by
+    bare name onto an inter-state edge (``ScalarToSymbolPromotion.apply_pass`` step 2 appends a
+    subscript only for non-Scalar containers, so a Scalar input is substituted verbatim).
+    """
+    array_derived: Set[str] = set()
+    deps: Dict[str, Set[str]] = {}
+    for state in sdfg.states():
+        for node in state.nodes():
+            if not isinstance(node, nodes.AccessNode):
+                continue
+            if not isinstance(sdfg.arrays.get(node.data), dt.Scalar):
+                continue
+            if state.in_degree(node) == 0:
+                continue
+            src = state.in_edges(node)[0].src
+            direct = deps.setdefault(node.data, set())
+            if isinstance(src, nodes.Tasklet):
+                for e in state.in_edges(src):
+                    if not isinstance(e.src, nodes.AccessNode):
+                        continue
+                    if isinstance(sdfg.arrays.get(e.src.data), dt.Scalar):
+                        direct.add(e.src.data)
+                    elif e.data.subset is not None and len(e.data.subset.free_symbols) > 0:
+                        array_derived.add(node.data)
+            elif isinstance(src, nodes.AccessNode) and isinstance(sdfg.arrays.get(src.data), dt.Scalar):
+                direct.add(src.data)
+    return array_derived, deps
+
+
 def find_promotable_scalars(sdfg: sd.SDFG, transients_only: bool = True, integers_only: bool = True) -> Set[str]:
     """
     Finds scalars that can be promoted to symbols in the given SDFG.
@@ -279,6 +321,28 @@ def find_promotable_scalars(sdfg: sd.SDFG, transients_only: bool = True, integer
     for candidate in list(candidates):
         if (sdfg.arrays[candidate].transient and candidate not in candidates_seen and candidate not in interstate_defs):
             candidates.remove(candidate)
+
+    # A candidate cannot be promoted when its defining tasklet reads another *Scalar* that is
+    # array-derived at a non-constant subscript. Step 2 of ``apply_pass`` substitutes a Scalar
+    # input by its bare name (a subscript is appended only for non-Scalar containers), so the
+    # candidate's inter-state assignment would carry a runtime Scalar's name -- which the symbolic
+    # layer may resolve to a sympy builtin (``denom`` -> ``sympy.denom``) and abort, or leave as a
+    # free symbol nothing defines. This is deliberately NARROW: only the substantive
+    # array-derivation cause rejects, propagated through Scalar-to-Scalar copies to a fixpoint. A
+    # dependency that is merely *not a candidate* for an incidental reason is left alone, so the
+    # long-standing promotion of a scalar reading a non-symbol Scalar
+    # (``test_promote_simple_c``: ``i`` reads ``j``, written by the same tasklet that reads it)
+    # is preserved.
+    array_derived, deps = _scalar_definition_dependencies(sdfg)
+    substantive: Set[str] = set(array_derived)
+    changed = True
+    while changed:
+        changed = False
+        for name, sources in deps.items():
+            if name not in substantive and (sources & substantive):
+                substantive.add(name)
+                changed = True
+    candidates -= substantive
 
     return candidates
 

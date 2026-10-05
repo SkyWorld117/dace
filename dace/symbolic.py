@@ -2431,6 +2431,37 @@ _PYSTR2SYM_locals = {
 _PYSTR2SYM_locals.update(_sympy_clash)
 
 
+def _symbol_clash_locals(expr: str) -> Dict[str, Any]:
+    """``_PYSTR2SYM_locals`` extended with bare identifiers that collide with a sympy builtin.
+
+    SymPy's parser resolves a name it does not know from its own namespace, so a data container
+    named ``denom`` becomes ``sympy.denom`` (a function) and ``denom < 1e-08`` cannot be parsed (a
+    relational between a function and a float). ``_sympy_clash`` already pins the common collisions
+    (one-letter names, ``pi``/``beta``/...); this covers the rest without knowing the SDFG's names.
+
+    Conservative: only a name used as a *plain operand* is rebound to a ``Symbol``. A name that is
+    called (``Lt(...)``, ``Abs(...)``) or is the object of an attribute (``math.floor``) keeps its
+    sympy meaning, and a name already mapped in ``_PYSTR2SYM_locals`` is left untouched.
+    """
+    try:
+        tree = ast.parse(expr, mode='eval')
+    except (SyntaxError, ValueError):
+        return _PYSTR2SYM_locals
+    callees = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    attr_objs = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    rebind = {
+        n.id: sympy.Symbol(n.id)
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Name) and n.id not in _PYSTR2SYM_locals and id(n) not in callees
+        and id(n) not in attr_objs and hasattr(sympy, n.id)
+    }
+    if not rebind:
+        return _PYSTR2SYM_locals
+    merged = dict(_PYSTR2SYM_locals)
+    merged.update(rebind)
+    return merged
+
+
 def pystr_to_symbolic(expr, symbol_map=None, simplify=None) -> sympy.Basic:
     """
     The visitor reconstructs symbolic expressions with non-evaluating SymPy
@@ -2483,7 +2514,18 @@ def _pystr_to_symbolic_uncached(expr, symbol_map=None, simplify=None) -> sympy.B
             expr = unparse(PythonOpToSympyConverter().visit(ast.parse(expr).body[0]))
 
     # TODO: support SymExpr over-approximated expressions
-    result = sympy.sympify(expr, _PYSTR2SYM_locals, evaluate=simplify)
+    # Parse with DaCe's normal locals first, so every expression that already parses is unaffected.
+    # Only when that fails (or yields a non-expression such as ``NotImplemented``) retry with bare
+    # names that collide with a sympy builtin rebound to Symbols -- see ``_symbol_clash_locals``.
+    clash_locals = _symbol_clash_locals(expr) if isinstance(expr, str) else _PYSTR2SYM_locals
+    try:
+        result = sympy.sympify(expr, _PYSTR2SYM_locals, evaluate=simplify)
+        if not isinstance(result, sympy.Basic) and clash_locals is not _PYSTR2SYM_locals:
+            result = sympy.sympify(expr, clash_locals, evaluate=simplify)
+    except (sympy.SympifyError, TypeError, AttributeError, ValueError):
+        if clash_locals is _PYSTR2SYM_locals:
+            raise
+        result = sympy.sympify(expr, clash_locals, evaluate=simplify)
     if isinstance(result, bool):
         # SymPy parses the literals ``True``/``False`` to Python bools; keep them as
         # SymPy booleans so they stay distinct from the integers ``1``/``0``.
