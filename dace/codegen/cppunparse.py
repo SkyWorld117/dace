@@ -1015,6 +1015,9 @@ class CPPUnparser:
         'tanh': 'dace::math::tanh', 'exp': 'dace::math::exp', 'log': 'dace::math::log',
         'log10': 'dace::math::log10', 'sqrt': 'dace::math::sqrt', 'erf': 'dace::math::erf',
         'erfc': 'dace::math::erfc',
+        # Fortran GAMMA / LOG_GAMMA -- ``dace::math::tgamma`` / ``lgamma``
+        # (float overloads, so real(4) stays single precision).
+        'tgamma': 'dace::math::tgamma', 'lgamma': 'dace::math::lgamma',
     }
 
     def _Call(self, t: ast.Call):
