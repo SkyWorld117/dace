@@ -1132,9 +1132,16 @@ class InvalidSDFGEdgeError(InvalidSDFGError):
         from dace.sdfg.state import SDFGState  # Avoid import loop
         state = self.sdfg.node(self.state_id)
 
-        # A control flow block that is not a state has no edges to index into
-        if self.edge_id is not None and isinstance(state, SDFGState):
-            e = state.edges()[self.edge_id]
+        # A control flow block that is not a state has no edges to index into.  Nor does a state
+        # whose edge belongs to an enclosing control-flow region: `edge_id` is a REGION id there, so
+        # indexing `state.edges()` by it raises IndexError from inside __str__ -- which means the
+        # error cannot be printed at all, and every caller that formats it (including the demotion
+        # loop in offload.py) sees `list index out of range` instead of the real message.
+        # Measured on ysu_prod.
+        state_edges = list(state.edges()) if isinstance(state, SDFGState) else []
+        if (self.edge_id is not None and isinstance(state, SDFGState)
+                and 0 <= self.edge_id < len(state_edges)):
+            e = state_edges[self.edge_id]
             edgestr = ", edge %s (%s:%s -> %s:%s)" % (
                 str(e.data),
                 str(e.src),
