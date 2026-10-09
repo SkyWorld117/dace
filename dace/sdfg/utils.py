@@ -2573,6 +2573,7 @@ def _specialize_scalar_impl(root: 'dace.SDFG', sdfg: 'dace.SDFG', scalars: Dict[
     # 3. Access Node
     # -> If access node is used then e.g. [scalar] -> [tasklet]
     # -> then create a [tasklet] that uses the scalar_val as a constant value inside
+    # -> If it is copied into another container, [scalar] -> [access node], a tasklet writes the constant there
     import numpy
     import re
     import ast
@@ -2645,12 +2646,21 @@ def _specialize_scalar_impl(root: 'dace.SDFG', sdfg: 'dace.SDFG', scalars: Dict[
         for e in state.edges():
             if e not in state.edges():
                 continue
-            if e.data is None or e.data.data not in scalars:
+            if e.data is None:
+                continue
+            # A copy out of the scalar may name either container in its memlet.
+            copied = (
+                isinstance(e.src, nd.AccessNode)
+                and e.src.data in scalars
+                and isinstance(e.dst, nd.AccessNode)
+                and e.dst.data not in scalars
+            )
+            if e.data.data not in scalars and not copied:
                 continue
 
-            # Now we know we have an edge where memlet.data is one of the scalars. Each edge carries
+            # Now we know we have an edge reading or writing one of the scalars. Each edge carries
             # exactly one data name, so the scalars partition the edges -- no edge is claimed twice.
-            scalar_name = e.data.data
+            scalar_name = e.src.data if copied else e.data.data
             scalar_val = scalars[scalar_name]
             scalar_dtype = scalar_dtypes[scalar_name]
 
@@ -2679,6 +2689,14 @@ def _specialize_scalar_impl(root: 'dace.SDFG', sdfg: 'dace.SDFG', scalars: Dict[
                     src.remove_out_connector(e.src_conn)
                 if e.dst_conn is not None:
                     dst.remove_in_connector(e.dst_conn)
+            elif copied:
+                # The container the scalar was copied into receives the constant instead; dropping the
+                # copy alone would leave it unwritten.
+                literal = _scalar_literal(scalar_val, scalar_dtype)
+                tasklet = state.add_tasklet(f"specialized_{scalar_name}", {}, {"_out"}, f"_out = {literal}")
+                subset = e.data.get_dst_subset(e, state)
+                state.add_edge(tasklet, "_out", dst, e.dst_conn, dace.memlet.Memlet(data=dst.data, subset=subset))
+                state.remove_edge(e)
             else:
                 state.remove_edge(e)
                 if e.src_conn is not None:
