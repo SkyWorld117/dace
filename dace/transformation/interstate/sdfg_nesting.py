@@ -136,9 +136,14 @@ class InlineSDFG(transformation.SingleStateTransformation):
                     or not InlineSDFG._check_strides(desc.strides, sdfg.arrays[mem.data].strides, mem, nested_sdfg)
                     for mem in (imem, omem)):
                 continue
-            # Inner access nodes must not be in a scope or copy from/to other data
-            accesses = [n for n in nstate.data_nodes() if n.data == conn]
-            if not accesses or any(nstate.entry_node(n) is not None for n in accesses):
+            # Inner access nodes must not be in a scope or copy from/to other data.
+            # Only the connector's OWN access nodes count: those sit at the nested state's
+            # scope bound to this SDFG's io.  An access to the same container inside a nested
+            # scope (e.g. a Map) is bound to that scope's connectors, resolves to the same outer
+            # memory, and must not disqualify the connector -- otherwise a perfectly inlinable
+            # shared connector is refused whenever the body re-reads what it wrote through a scope.
+            accesses = [n for n in nstate.nodes() if isinstance(n, nodes.AccessNode) and n.data == conn]
+            if not accesses:
                 continue
             if any(
                     isinstance(neighbor, (nodes.AccessNode, nodes.LibraryNode)) for n in accesses

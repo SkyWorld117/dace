@@ -43,7 +43,11 @@ class CodeIOStream(StringIO):
                             try:
                                 state = cfg.state(state_id)
                                 node_id[i] = state.node_id(nid)
-                            except NodeNotFoundError:
+                            except (NodeNotFoundError, TypeError):
+                                # `cfg.state` raises TypeError (not only NodeNotFoundError) when the
+                                # enclosing CFG is a control-flow region whose node(id) indexing does
+                                # not match its nodes() -- measured for a ConditionalBlock.  This is
+                                # a source-location annotation only; never let it fail codegen.
                                 node_id[i] = -1
                     location_identifier += ':' + ','.join([str(nid) for nid in node_id])
         else:
