@@ -528,18 +528,28 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
                 # Store in/out edges in lists so that they don't get corrupted when they are removed from the graph.
                 in_edges = list(state.in_edges(gcode))
                 out_edges = list(state.out_edges(gcode))
-                me.in_connectors = {('IN_' + e.dst_conn): None for e in in_edges}
-                me.out_connectors = {('OUT_' + e.dst_conn): None for e in in_edges}
-                mx.in_connectors = {('IN_' + e.src_conn): None for e in out_edges}
-                mx.out_connectors = {('OUT_' + e.src_conn): None for e in out_edges}
+                # Edges without a connector only order the tasklet (empty memlets): they pass through the map as
+                # empty edges and get no connectors of their own.
+                me.in_connectors = {('IN_' + e.dst_conn): None for e in in_edges if e.dst_conn is not None}
+                me.out_connectors = {('OUT_' + e.dst_conn): None for e in in_edges if e.dst_conn is not None}
+                mx.in_connectors = {('IN_' + e.src_conn): None for e in out_edges if e.src_conn is not None}
+                mx.out_connectors = {('OUT_' + e.src_conn): None for e in out_edges if e.src_conn is not None}
 
                 # Create memlets through map
                 for e in in_edges:
                     state.remove_edge(e)
+                    if e.dst_conn is None:
+                        state.add_nedge(e.src, me, dc(e.data))
+                        state.add_nedge(me, e.dst, dc(e.data))
+                        continue
                     state.add_edge(e.src, e.src_conn, me, 'IN_' + e.dst_conn, e.data)
                     state.add_edge(me, 'OUT_' + e.dst_conn, e.dst, e.dst_conn, dc(e.data))
                 for e in out_edges:
                     state.remove_edge(e)
+                    if e.src_conn is None:
+                        state.add_nedge(e.src, mx, dc(e.data))
+                        state.add_nedge(mx, e.dst, dc(e.data))
+                        continue
                     state.add_edge(e.src, e.src_conn, mx, 'IN_' + e.src_conn, e.data)
                     state.add_edge(mx, 'OUT_' + e.src_conn, e.dst, e.dst_conn, dc(e.data))
 
