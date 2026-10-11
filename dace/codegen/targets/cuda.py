@@ -3320,7 +3320,8 @@ def _get_const_params(dfg_scope):
     state = dfg_scope.graph
     sdfg = dfg_scope.parent
     scope_entry = dfg_scope.source_nodes()[0]
-    scope_exit = dfg_scope.sink_nodes()[0]
+    # The scope's exit node: a kernel scope may hold other sinks, such as access nodes written last.
+    scope_exit = state.exit_node(scope_entry)
     input_params = set(e.data.data for e in state.in_edges(scope_entry))
     output_params = set(e.data.data for e in state.out_edges(scope_exit))
     toplevel_params = set(node.data for node in dfg_scope.nodes()
