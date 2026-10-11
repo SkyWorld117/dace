@@ -792,6 +792,14 @@ class ScalarToSymbolPromotion(passes.Pass):
                 if node not in state or state.in_degree(node) == 0:
                     continue
                 in_edge = state.in_edges(node)[0]
+                if in_edge.data.is_empty():
+                    # An empty memlet only orders the scalar's reads after its source; it writes nothing. The
+                    # readers keep that order themselves, and the node is a plain read of the symbol.
+                    for out_edge in state.out_edges(node):
+                        if not state.edges_between(in_edge.src, out_edge.dst):
+                            state.add_nedge(in_edge.src, out_edge.dst, mm.Memlet())
+                    state.remove_edge(in_edge)
+                    continue
                 input = in_edge.src
 
                 # There is only zero or one incoming edges by definition
