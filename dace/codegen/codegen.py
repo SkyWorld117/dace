@@ -127,12 +127,22 @@ def _get_codegen_targets(sdfg: SDFG, frame: framecode.DaCeCodeGenerator):
                         dst_node = leaf_e.dst
                         if leaf_e.data.is_empty():
                             continue
+                        # A NestedSDFG's I/O is passed by reference, never emitted as a copy (the
+                        # AccessNode/Tasklet generators skip non-AccessNode destinations), so its
+                        # copy dispatcher must not be declared here. Declaring it can register a
+                        # trap dispatcher (e.g. CUDA's IllegalCopy for CPU_Heap->Register under a
+                        # GPU schedule) that is never used, failing the used==declared check below.
+                        if isinstance(dst_node, dace.nodes.NestedSDFG):
+                            continue
                         tgt = disp.get_copy_dispatcher(node, dst_node, leaf_e, state.parent, state)
                         if tgt is not None:
                             frame.targets.add(tgt)
                 else:
                     # Rooted at dst_node
                     dst_node = mtree.root().edge.dst
+                    # See the NestedSDFG note above: its boundary is a reference, not a copy.
+                    if isinstance(dst_node, dace.nodes.NestedSDFG):
+                        continue
                     tgt = disp.get_copy_dispatcher(node, dst_node, e, state.parent, state)
                     if tgt is not None:
                         frame.targets.add(tgt)

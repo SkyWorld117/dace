@@ -222,7 +222,18 @@ set(DACE_LIBS ${DACE_LIBS} ${DACE_ENV_LIBRARIES})
 string(REPLACE "_DACE_CMAKE_EXPAND" "$" DACE_ENV_LINK_FLAGS "${DACE_ENV_LINK_FLAGS}")
 string(REPLACE "_DACE_CMAKE_EXPAND" "$" DACE_ENV_COMPILE_FLAGS "${DACE_ENV_COMPILE_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${DACE_ENV_COMPILE_FLAGS}")
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${DACE_ENV_LINK_FLAGS}")
+# Bind inner references to THIS library's own definitions.
+#
+# Every DaCe SDFG shared library defines the same generic helpers with global names --
+# __dace_init_cuda, __dace_exit_cuda, __dace_gpu_drain_error, __dace_gpu_last_error,
+# __dace_gpu_set_stream, __dace_gpu_set_all_streams -- and their intra-library calls go through the
+# PLT.  When one process loads several such libraries (WRF links 43 kernels' .so into one wrf.exe),
+# the dynamic linker resolves every library's internal __dace_init_cuda to the FIRST-loaded one, so
+# a kernel is initialised with another kernel's context dimensions and then reads its events[]/
+# streams[] out of bounds -- a host-side SIGSEGV in cuEventSynchronize (W45-interposition.md).
+# -Bsymbolic-functions binds only *function* references locally (data symbols stay interposable, so
+# copy relocations are unaffected) and is sufficient here: all six helpers are functions.
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${DACE_ENV_LINK_FLAGS} -Wl,-Bsymbolic-functions")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${DACE_ENV_LINK_FLAGS}")
 set(CMAKE_STATIC_LINKER_FLAGS "${CMAKE_STATIC_LINKER_FLAGS} ${DACE_ENV_LINK_FLAGS}")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${DACE_ENV_LINK_FLAGS}")

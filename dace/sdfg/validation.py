@@ -362,10 +362,15 @@ def validate_sdfg(sdfg: 'dace.sdfg.SDFG', references: Set[int] = None, **context
         validate_control_flow_region(sdfg, sdfg, initialized_transients, symbols, references, **context)
 
     except InvalidSDFGError as ex:
-        # If the SDFG is invalid, save it
-        fpath = os.path.join('_dacegraphs', 'invalid.sdfgz')
-        sdfg.save(fpath, exception=ex, compress=True)
-        ex.path = fpath
+        # If the SDFG is invalid, save it for inspection -- but only when debug printing is on.
+        # A caller that uses validate() as an oracle (e.g. dace_fortran's offload promote/demote
+        # loop, which validates once per round and expects most rounds to fail) would otherwise
+        # serialize the whole graph to disk on every failure.
+        from dace.config import Config
+        if Config.get_bool('debugprint'):
+            fpath = os.path.join('_dacegraphs', 'invalid.sdfgz')
+            sdfg.save(fpath, exception=ex, compress=True)
+            ex.path = fpath
         raise
 
 
