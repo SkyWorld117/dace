@@ -1884,6 +1884,10 @@ class CPUCodeGen(TargetCodeGenerator):
         # Arguments are input connectors, output connectors, and symbols
         codegen = self.calling_codegen
         memlet_references = codegen.generate_nsdfg_arguments(sdfg, cfg, dfg, state_dfg, node)
+        if not inline:
+            # A compile-time constant of the nested SDFG is emitted into its function (``generate_constants``
+            # below), not passed: a parameter of the same name would clash with that declaration.
+            memlet_references = [ref for ref in memlet_references if ref[1] not in node.sdfg.constants_prop]
 
         if not inline and (not unique_functions or not code_already_generated):
             nested_stream.write(
