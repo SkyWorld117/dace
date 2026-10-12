@@ -1,8 +1,10 @@
 # Copyright 2019-2024 ETH Zurich and the DaCe authors. All rights reserved.
 
 import numpy as np
+import pytest
 import dace
-from dace.sdfg.state import ConditionalBlock
+from dace.properties import CodeBlock
+from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
 from dace.transformation.passes.simplification.prune_empty_conditional_branches import PruneEmptyConditionalBranches
 
 
@@ -99,6 +101,50 @@ def test_prune_empty_if_with_else():
     assert np.allclose(A2, verif2)
 
 
-if __name__ == '__main__':
+@pytest.mark.parametrize(
+    "conditions, empty, taken",
+    [
+        # An empty first branch: the second one is still not taken when the first condition holds.
+        (["a > 0", "a > -5"], [0], {1: 0, -1: 2, -9: 0}),
+        (["a > 0", "a > -5", None], [0], {1: 0, -1: 2, -9: 3}),
+        # Two empty branches before a conditional and an else branch.
+        (["a > 5", "a == 3", "a > 0", None], [0, 1], {9: 0, 3: 0, 1: 3, -1: 4}),
+        # An empty branch between two others: only the branches after it test its negation.
+        (["a == 1", "a < 3", "a < 5", None], [1], {1: 1, 2: 0, 4: 3, 7: 4}),
+    ],
+)
+def test_prune_empty_branch_before_others(conditions, empty, taken):
+    """Every branch after an eliminated one keeps not being taken when the eliminated condition holds. ``empty``:
+    the branches without work; ``taken``: per value of ``a``, the branch (1-based, 0 for none) whose work runs."""
+    sdfg = dace.SDFG("prune_empty_branch_before_others")
+    sdfg.add_symbol("a", dace.int32)
+    sdfg.add_array("out", [1], dace.int32)
+    start = sdfg.add_state("start", is_start_block=True)
+    conditional = ConditionalBlock("cond")
+    sdfg.add_node(conditional)
+    sdfg.add_edge(start, conditional, dace.InterstateEdge())
+    for i, condition in enumerate(conditions):
+        branch = ControlFlowRegion(f"branch_{i}", sdfg)
+        state = branch.add_state(f"write_{i}", is_start_block=True)
+        if i not in empty:
+            tasklet = state.add_tasklet(f"set_{i}", {}, {"o"}, f"o = {i + 1}")
+            state.add_edge(tasklet, "o", state.add_write("out"), None, dace.Memlet("out[0]"))
+        conditional.add_branch(None if condition is None else CodeBlock(condition), branch)
+    sdfg.add_edge(conditional, sdfg.add_state("end"), dace.InterstateEdge())
+
+    res = PruneEmptyConditionalBranches().apply_pass(sdfg, {})
+    assert res[conditional.cfg_id] == len(empty)
+    assert len(conditional.branches) == len(conditions) - len(empty)
+    sdfg.validate()
+
+    compiled = sdfg.compile()
+    for a, branch in taken.items():
+        out = np.zeros([1], dtype=np.int32)
+        compiled(out=out, a=a)
+        assert out[0] == branch, (a, out[0], branch)
+
+
+if __name__ == "__main__":
     test_prune_empty_else()
     test_prune_empty_if_with_else()
+    test_prune_empty_branch_before_others(["a > 0", "a > -5", None], [0], {1: 0, -1: 2, -9: 3})
