@@ -1526,7 +1526,13 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
             for sd, name in to_remove:
                 del self.pool_release[sd, name]
 
-            if state.nosync == False:
+            if state.nosync == False and common.emit_gpu_synchronization():
+                # The `emit_gpu_synchronization()` guard is what makes
+                # `compiler.cuda.emit_synchronization: false` (and `__DACE_NO_SYNC=1`) actually
+                # suppress the END-OF-STATE stream sync. Without it this was the only sync site not
+                # gated by the knob, so the knob removed 1 of 26 syncs instead of 25 (the other 25
+                # are exactly the end-of-state syncs emitted here). Default is `true`, so the
+                # historical output is byte-identical (MFC pins `emit_synchronization: true`).
                 # Ordered set: the default stream is named by a string, so a plain set would order the
                 # synchronizations below by hash and make the emitted code depend on PYTHONHASHSEED.
                 streams_to_sync = {}
