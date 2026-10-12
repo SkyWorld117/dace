@@ -140,6 +140,7 @@ class MakeTransientsPersistent(ppl.Pass):
         """The names in ``nsdfg`` that every one of their access nodes allows promoting."""
         persistent: Set[str] = set()
         refused: Set[str] = set()
+        shared = self._shared_allocations(nsdfg)
         for state in nsdfg.states():
             for dnode in state.data_nodes():
                 if dnode.data in refused:
@@ -156,9 +157,33 @@ class MakeTransientsPersistent(ppl.Pass):
                 if not size_is_program_wide(nsdfg, desc, allowed):
                     refused.add(dnode.data)
                     continue
-                if xfh.get_parent_map(state, dnode) is not None:
+                if xfh.get_parent_map(state, dnode) is not None and dnode.data not in shared:
                     if self.toplevel_only or desc.lifetime == dtypes.AllocationLifetime.Scope:
                         refused.add(dnode.data)
                         continue
                 persistent.add(dnode.data)
         return persistent - refused
+
+    @staticmethod
+    def _shared_allocations(nsdfg: SDFG) -> Set[str]:
+        """The names whose single allocation every scope using them shares.
+
+        A Scope allocation sits in the innermost scope that encloses all access nodes of the name.
+        Once two of them are in different states, or one is outside every scope of its state,
+        that is the state or the SDFG, so the threads of a map that also accesses the name already
+        share one buffer, and a persistent one changes nothing for them. This holds only where
+        ``nsdfg`` itself runs once per call: inside a map, each of its executions allocates anew.
+        """
+        if any(xfh.get_parent_map(state) is not None for state in nsdfg.states()):
+            return set()
+        sites: Dict[str, Set[Any]] = {}
+        for state in nsdfg.states():
+            scope = state.scope_dict()
+            for dnode in state.data_nodes():
+                outer = scope[dnode]
+                while outer is not None and scope[outer] is not None:
+                    outer = scope[outer]
+                sites.setdefault(dnode.data, set()).add((state, outer))
+        return {
+            name for name, where in sites.items() if len(where) > 1 or any(outer is None for _, outer in where)
+        }

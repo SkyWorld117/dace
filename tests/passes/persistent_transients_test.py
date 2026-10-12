@@ -139,7 +139,66 @@ def test_stronger_lifetimes_are_not_demoted():
         assert sdfg.arrays['buf'].lifetime == lifetime
 
 
-if __name__ == '__main__':
+def map_writing_transient_inside(name: str, also_read_outside: bool) -> dace.SDFG:
+    """``for i in map(0:N): buf[i] = a[i] * 2; out[i] = buf[i]`` with ``buf``'s access node INSIDE the map,
+    and, if ``also_read_outside``, a second state that copies ``buf`` to ``out2`` at the top level."""
+    sdfg = dace.SDFG(name)
+    sdfg.add_array("a", [N], dace.float64)
+    sdfg.add_array("out", [N], dace.float64)
+    sdfg.add_transient("buf", [64], dace.float64, storage=dace.StorageType.CPU_Heap)
+    state = sdfg.add_state("compute", is_start_block=True)
+    entry, exit_ = state.add_map("m", {"i": "0:N"})
+    writer = state.add_tasklet("w", {"x"}, {"y"}, "y = x * 2.0")
+    state.add_memlet_path(state.add_read("a"), entry, writer, dst_conn="x", memlet=dace.Memlet("a[i]"))
+    inner = state.add_access("buf")
+    state.add_edge(writer, "y", inner, None, dace.Memlet("buf[i]"))
+    reader = state.add_tasklet("r", {"x"}, {"y"}, "y = x")
+    state.add_edge(inner, None, reader, "x", dace.Memlet("buf[i]"))
+    state.add_memlet_path(reader, exit_, state.add_write("out"), src_conn="y", memlet=dace.Memlet("out[i]"))
+    if also_read_outside:
+        sdfg.add_array("out2", [64], dace.float64)
+        after = sdfg.add_state_after(state, "copy")
+        after.add_nedge(after.add_read("buf"), after.add_write("out2"), dace.Memlet("buf[0:64]"))
+    sdfg.validate()
+    return sdfg
+
+
+def test_transient_also_used_outside_its_map_is_promoted():
+    """An access node inside a map does not make the allocation per scope entry when another one sits in a
+    different state: the buffer is then allocated once per call for the whole SDFG, shared by the map's
+    threads already, and allocating it once per run instead changes nothing for them."""
+    sdfg = map_writing_transient_inside("persist_shared_map", also_read_outside=True)
+    assert MakeTransientsPersistent().apply_pass(sdfg, {})[sdfg.cfg_id] == {"buf"}
+    assert sdfg.arrays["buf"].lifetime == dace.AllocationLifetime.Persistent
+    assert allocates_in_init(sdfg, "buf")
+
+
+def test_transient_used_only_inside_one_map_is_not_promoted():
+    """Every access node in one map scope: the allocation is the scope's own, once per scope entry."""
+    sdfg = map_writing_transient_inside("persist_private_map", also_read_outside=False)
+    assert MakeTransientsPersistent().apply_pass(sdfg, {}) is None
+    assert sdfg.arrays["buf"].lifetime == dace.AllocationLifetime.Scope
+
+
+def test_transient_of_a_nested_sdfg_inside_a_map_is_not_promoted():
+    """A nested SDFG inside a map runs once per iteration: even a name it uses in two states is allocated
+    by every one of those runs."""
+    nest = map_writing_transient_inside("persist_nest_inner", also_read_outside=True)
+    sdfg = dace.SDFG("persist_nest_outer")
+    for name in ("a", "out", "out2"):
+        sdfg.add_array(name, nest.arrays[name].shape, dace.float64)
+    state = sdfg.add_state("s", is_start_block=True)
+    entry, exit_ = state.add_map("outer", {"k": "0:2"})
+    node = state.add_nested_sdfg(nest, {"a"}, {"out", "out2"}, symbol_mapping={"N": "N"})
+    state.add_memlet_path(state.add_read("a"), entry, node, dst_conn="a", memlet=dace.Memlet("a[0:N]"))
+    state.add_memlet_path(node, exit_, state.add_write("out"), src_conn="out", memlet=dace.Memlet("out[0:N]"))
+    state.add_memlet_path(node, exit_, state.add_write("out2"), src_conn="out2", memlet=dace.Memlet("out2[0:64]"))
+    sdfg.validate()
+    assert MakeTransientsPersistent().apply_pass(sdfg, {}) is None
+    assert nest.arrays["buf"].lifetime == dace.AllocationLifetime.Scope
+
+
+if __name__ == "__main__":
     test_free_symbol_sized_transient_is_promoted()
     test_the_auto_optimize_helper_delegates()
     test_the_helper_reports_every_cfg_id()
@@ -147,3 +206,6 @@ if __name__ == '__main__':
     test_reassigned_size_symbol_is_not_promoted()
     test_loop_variable_sized_nested_transient_is_not_promoted()
     test_stronger_lifetimes_are_not_demoted()
+    test_transient_also_used_outside_its_map_is_promoted()
+    test_transient_used_only_inside_one_map_is_not_promoted()
+    test_transient_of_a_nested_sdfg_inside_a_map_is_not_promoted()
