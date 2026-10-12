@@ -106,7 +106,7 @@ def test_dse_inside_loop_conditional():
     cond_block = ConditionalBlock('cond', sdfg, loop)
     loop.add_node(cond_block)
     b1 = ControlFlowRegion('b1', sdfg)
-    b1.add_state()
+    s1 = b1.add_state()
     cond_block.add_branch(CodeBlock('a > 0'), b1)
     b2 = ControlFlowRegion('b2', sdfg)
     s2 = b2.add_state()
@@ -119,7 +119,64 @@ def test_dse_inside_loop_conditional():
     loop.add_edge(cond_block, e, dace.InterstateEdge())
 
     DeadStateElimination().apply_pass(sdfg, {})
-    assert set(sdfg.states()) == {start, s, s2, e, end}
+    # ``a > 0`` is tested before the always true ``a >= a`` and is taken whenever it holds; only ``a < 0`` is dead.
+    assert set(sdfg.states()) == {start, s, s1, s2, e, end}
+    assert [b for _, b in cond_block.branches] == [b1, b2]
+
+
+def _first_true_branch_sdfg(name: str, conditions):
+    """An SDFG writing ``i + 1`` to ``out[0]`` in the branch ``i`` of a conditional block with ``conditions``
+    (``None`` for an else branch), all of them reading the symbol ``a``."""
+    sdfg = dace.SDFG(name)
+    sdfg.add_symbol("a", dace.int32)
+    sdfg.add_array("out", [1], dace.int32)
+    start = sdfg.add_state("start", is_start_block=True)
+    cond_block = ConditionalBlock("cond")
+    sdfg.add_node(cond_block)
+    sdfg.add_edge(start, cond_block, dace.InterstateEdge())
+    for i, condition in enumerate(conditions):
+        branch = ControlFlowRegion(f"branch_{i}", sdfg)
+        state = branch.add_state(f"write_{i}", is_start_block=True)
+        tasklet = state.add_tasklet(f"set_{i}", {}, {"o"}, f"o = {i + 1}")
+        state.add_edge(tasklet, "o", state.add_write("out"), None, dace.Memlet("out[0]"))
+        cond_block.add_branch(None if condition is None else CodeBlock(condition), branch)
+    sdfg.add_edge(cond_block, sdfg.add_state("end"), dace.InterstateEdge())
+    return sdfg, cond_block
+
+
+@pytest.mark.parametrize(
+    "conditions, kept, taken",
+    [
+        (["a == 1", "a == 2", "1 == 1", None], [0, 1, 2], {1: 1, 2: 2, 3: 3}),
+        (["a == 1", "a == 2", "1 == 1"], [0, 1, 2], {1: 1, 2: 2, 3: 3}),
+        (["a == 1", "1 == 0", "1 == 1", "a == 3"], [0, 2], {1: 1, 2: 3, 3: 3}),
+    ],
+)
+def test_dse_keeps_branches_before_definitely_true_condition(conditions, kept, taken):
+    """A branch whose condition is definitely true makes every LATER branch dead, never an earlier one: the block
+    still takes an earlier branch whenever that branch's condition holds. ``kept``: the branches left; ``taken``:
+    the branch (1-based) the block takes for each value of ``a``."""
+    sdfg, cond_block = _first_true_branch_sdfg("dse_branches_before_true", conditions)
+
+    DeadStateElimination().apply_pass(sdfg, {})
+    sdfg.validate()
+    assert [b.label for _, b in cond_block.branches] == [f"branch_{i}" for i in kept]
+
+    compiled = sdfg.compile()
+    for a, branch in taken.items():
+        out = np.zeros([1], dtype=np.int32)
+        compiled(out=out, a=a)
+        assert out[0] == branch, (a, out[0], branch)
+
+
+def test_dse_inlines_definitely_true_branch_after_false_ones():
+    """With every earlier condition definitely false, the definitely true branch is the only one left and is
+    inlined."""
+    sdfg, cond_block = _first_true_branch_sdfg("dse_true_after_false", ["1 == 0", "a == a", "a == 2", None])
+    DeadStateElimination().apply_pass(sdfg, {})
+    sdfg.validate()
+    assert cond_block not in sdfg.nodes()
+    assert {s.label for s in sdfg.states()} == {"start", "write_1", "end"}
 
 
 def test_dse_malformed_conditional_block():
@@ -593,6 +650,10 @@ if __name__ == '__main__':
     test_dse_edge_condition_with_integer_as_boolean_regression()
     test_dse_inside_loop()
     test_dse_inside_loop_conditional()
+    test_dse_keeps_branches_before_definitely_true_condition(
+        ["a == 1", "a == 2", "1 == 1", None], [0, 1, 2], {1: 1, 2: 2, 3: 3}
+    )
+    test_dse_inlines_definitely_true_branch_after_false_ones()
     test_dse_malformed_conditional_block()
     test_dse_after_return()
     test_dse_after_break()
