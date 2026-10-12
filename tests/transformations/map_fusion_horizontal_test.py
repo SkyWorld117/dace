@@ -468,7 +468,67 @@ def test_horizontal_fusion_rejects_a_disagreeing_dynamic_map_range(binding: str)
     sdfg.validate()
 
 
-if __name__ == '__main__':
+def _make_waw_states_sdfg(overlap: bool) -> dace.SDFG:
+    """Two states, each a Map writing the first column of ``out`` from its own input: the second overwrites
+    what the first wrote, element by element, or, with ``overlap``, one row further down."""
+    sdfg = dace.SDFG(unique_name("waw_states_sdfg"))
+    for name in ("A", "B"):
+        sdfg.add_array(name, shape=(10,), dtype=dace.float64, transient=False)
+    sdfg.add_array("out", shape=(11, 2), dtype=dace.float64, transient=False)
+    first = sdfg.add_state("first", is_start_block=True)
+    first.add_mapped_tasklet(
+        "first_map",
+        map_ranges={"i": "0:10"},
+        inputs={"__in": dace.Memlet("A[i]")},
+        code="__out = __in + 1.0",
+        outputs={"__out": dace.Memlet("out[i, 0]")},
+        external_edges=True,
+    )
+    second = sdfg.add_state_after(first, "second")
+    second.add_mapped_tasklet(
+        "second_map",
+        map_ranges={"j": "0:10"},
+        inputs={"__in": dace.Memlet("B[j]")},
+        code="__out = __in + 2.0",
+        outputs={"__out": dace.Memlet("out[j + 1, 0]" if overlap else "out[j, 0]")},
+        external_edges=True,
+    )
+    sdfg.validate()
+    return sdfg
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_horizontal_fusion_through_the_ordering_edge_of_a_state_fusion(overlap: bool):
+    """``StateFusionExtended`` orders the second state after the first with an empty Memlet from the first
+    Map's output to the second state's SOURCE node, the input of the second Map. The Maps are fused when
+    each element is written by the same iteration of both (the order then holds per iteration) and stay
+    apart when an iteration of the second overwrites what another iteration of the first wrote."""
+    from dace.transformation.interstate.state_fusion_with_happens_before import StateFusionExtended
+
+    sdfg = _make_waw_states_sdfg(overlap)
+    assert sdfg.apply_transformations_repeated(StateFusionExtended) == 1
+    state = sdfg.start_block
+    ordering = [e for e in state.edges() if e.data.is_empty()]
+    assert len(ordering) == 1 and isinstance(ordering[0].dst, nodes.AccessNode) and ordering[0].dst.data == "B"
+
+    fused = sdfg.apply_transformations_repeated(dftrans.MapFusionHorizontal, validate_all=True)
+    assert fused == (0 if overlap else 1)
+    assert count_nodes(state, nodes.MapEntry) == (2 if overlap else 1)
+
+    A = np.random.rand(10)
+    B = np.random.rand(10)
+    out = np.zeros((11, 2))
+    sdfg(A=A, B=B, out=out)
+    ref = np.zeros((11, 2))
+    ref[0:10, 0] = A + 1.0
+    if overlap:
+        ref[1:11, 0] = B + 2.0
+    else:
+        ref[0:10, 0] = B + 2.0
+    assert np.allclose(out, ref)
+
+
+if __name__ == "__main__":
     test_horizontal_fusion_relocates_a_multi_edge_connector_once()
     test_horizontal_fusion_drops_an_equal_dynamic_map_range("same_node")
     test_horizontal_fusion_drops_an_equal_dynamic_map_range("same_data")
@@ -482,3 +542,5 @@ if __name__ == '__main__':
     test_vertical_maps_are_not_fused_horizontally()
     test_deterministic_label_in_horizontal_map_fusion(first_order=True)
     test_deterministic_label_in_horizontal_map_fusion(first_order=False)
+    test_horizontal_fusion_through_the_ordering_edge_of_a_state_fusion(overlap=False)
+    test_horizontal_fusion_through_the_ordering_edge_of_a_state_fusion(overlap=True)

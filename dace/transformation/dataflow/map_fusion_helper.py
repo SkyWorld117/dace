@@ -546,7 +546,8 @@ def find_happens_before_connection(
     The function returns the ordering edges if, and only if, `first_map_entry` is the
     upstream Map and every connection to `second_map_entry` is an empty Memlet that
     goes *directly* from the first Map (its MapExit, or an AccessNode that only the
-    first Map writes) into `second_map_entry`. In every other case -- the Maps are
+    first Map writes) into `second_map_entry` (or into an AccessNode that nothing
+    writes and only the second Map reads). In every other case -- the Maps are
     parallel, the direction is reversed, real data flows between them, or a third node
     sits in between and would lose its own ordering -- `None` is returned.
 
@@ -579,11 +580,22 @@ def find_happens_before_connection(
         if isinstance(e.dst, nodes.AccessNode) and all(ie.src is first_map_exit for ie in state.in_edges(e.dst))
     }
 
+    # Nodes that the second Map alone reads and that nothing writes; an ordering edge may also
+    #  end there, which is where `StateFusionExtended` puts it: on the second state's source
+    #  node that leads to the hazard.
+    own_inputs: Set[nodes.Node] = {
+        e.src
+        for e in state.in_edges(second_map_entry)
+        if isinstance(e.src, nodes.AccessNode)
+        and all(oe.dst is second_map_entry for oe in state.out_edges(e.src))
+        and all(ie.data is not None and ie.data.is_empty() for ie in state.in_edges(e.src))
+    }
+
     ordering_edges: List[graph.MultiConnectorEdge[dace.Memlet]] = []
     for edge in state.edges():
         if edge.data is None or not edge.data.is_empty():
             continue
-        if edge.dst is not second_map_entry:
+        if edge.dst is not second_map_entry and edge.dst not in own_inputs:
             continue
         if edge.src is not first_map_exit and edge.src not in own_outputs:
             # Something else orders the second Map as well. Dropping the edge would
