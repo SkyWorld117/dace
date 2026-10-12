@@ -629,6 +629,11 @@ class pointer(typeclass):
     def to_json(self):
         return {'type': 'pointer', 'dtype': self._typeclass.to_json()}
 
+    def to_string(self):
+        """A string that evaluates to this type after a ``dace.`` prefix, as ``typeclass.to_string`` does:
+        ``pointer(dace.float64)``. Pointers have no type name of their own."""
+        return f"pointer(dace.{self._typeclass.to_string()})"
+
     @staticmethod
     def from_json(json_obj, context=None):
         if json_obj['type'] != 'pointer':
