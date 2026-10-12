@@ -42,6 +42,36 @@ def test_short_loop_unroll_gate_on_trip_count():
     assert np.allclose(B[0], A.sum())
 
 
+def test_short_loop_unroll_keeps_the_loops_the_predicate_names():
+    """``keep`` leaves the loops it accepts as loops, asked after their inner loops were unrolled; the others
+    unroll as before."""
+
+    @dace.program
+    def nested(A: dace.float64[4, 3], B: dace.float64[4]):
+        for i in range(4):
+            acc = 0.0
+            for j in range(3):
+                acc += A[i, j]
+            B[i] = acc
+
+    seen = []
+
+    def keep(loop: LoopRegion, sdfg: dace.SDFG) -> bool:
+        inner = [r for r in loop.all_control_flow_regions() if isinstance(r, LoopRegion) and r is not loop]
+        seen.append((loop.loop_variable, len(inner)))
+        return not inner and loop.loop_variable == "i"
+
+    sdfg = nested.to_sdfg(simplify=True)
+    assert _num_loops(sdfg) == 2
+    ShortLoopUnroll(unroll_limit=8, keep=keep).apply_pass(sdfg, {})
+    assert _num_loops(sdfg) == 1  # the inner loop unrolled, the outer one kept
+    assert ("i", 0) in seen  # asked once its inner loop was gone
+    A = np.random.default_rng(7).random((4, 3))
+    B = np.zeros(4)
+    sdfg(A=A, B=B)
+    assert np.allclose(B, A.sum(axis=1))
+
+
 def test_short_loop_unroll_branchy_and_straightline_value_preserving() -> None:
     """Constant-trip branchy / straight-line short loops unroll and stay value-preserving.
 

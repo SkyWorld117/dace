@@ -13,7 +13,7 @@ Transformation classes are imported lazily inside the methods: importing them at
 module load would cycle (this package is imported by the transformations those
 imports pull in).
 """
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from dace import properties, symbolic
 from dace.sdfg import SDFG
@@ -112,8 +112,12 @@ class ShortLoopUnroll(ppl.Pass):
         default=DEFAULT_UNROLL_LIMIT,
         desc='Fully unroll constant-trip loops with at most this many iterations (0 disables).')
 
-    def __init__(self, unroll_limit: int = DEFAULT_UNROLL_LIMIT):
+    def __init__(self, unroll_limit: int = DEFAULT_UNROLL_LIMIT,
+                 keep: Optional[Callable[[LoopRegion, SDFG], bool]] = None):
+        """:param keep: loops for which ``keep(loop, sdfg)`` is true stay loops (asked when the loop is next in
+                        line, i.e. after the loops it contains were unrolled)."""
         self.unroll_limit = unroll_limit
+        self._keep = keep
 
     def modifies(self) -> ppl.Modifies:
         return ppl.Modifies.Everything
@@ -156,6 +160,8 @@ class ShortLoopUnroll(ppl.Pass):
             for loop in sorted(_loops(sdfg), key=_loop_depth, reverse=True):
                 trip = _constant_trip_count(loop, sdfg)
                 if trip is None or trip > self.unroll_limit:
+                    continue
+                if self._keep is not None and self._keep(loop, sdfg):
                     continue
                 parent = loop.parent_graph
                 # Applicability is decided FIRST, on its own, so a refusal is distinguishable
