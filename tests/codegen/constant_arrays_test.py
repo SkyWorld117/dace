@@ -1,4 +1,6 @@
 # Copyright 2019-2022 ETH Zurich and the DaCe authors. All rights reserved.
+import re
+
 import dace
 import numpy as np
 from dace import dtypes
@@ -71,7 +73,34 @@ def test_nsdfg_holding_its_input_as_constant():
     np.testing.assert_array_equal(out, np.tile([1.0, 2.0, 3.0], 4))
 
 
+def _kernel_code(sdfg: dace.SDFG) -> str:
+    """The generated CUDA code of ``sdfg`` (code generation only: no GPU or compiler is needed)."""
+    return "\n".join(code.clean_code for code in sdfg.generate_code() if code.language == "cu")
+
+
+def test_gpu_kernel_reading_constant_in_tasklet():
+    """A kernel declares a constant it reads itself: no illegal host-to-device copy, and no kernel parameter of the
+    same name."""
+    code = _kernel_code(_map_reading_constant(through_nested=False, gpu=True))
+    kernel = re.search(r"__global__ void[^{]*?\b\w+\(([^()]*)\)\s*\{\s*constexpr double C\[3\]", code)
+    assert kernel, "the kernel does not declare the constant first"
+    assert not re.search(r"\bC\b", kernel.group(1)), kernel.group(1)
+
+
+def test_gpu_kernel_reading_constant_in_nested_sdfg():
+    """The same with the constant read by a nested SDFG in the kernel: code generation used to stop at its check that
+    the targets it predicted (an illegal copy for the constant) are the ones it used."""
+    code = _kernel_code(_map_reading_constant(through_nested=True, gpu=True))
+    headers = re.findall(r"(?:__global__|DACE_DFI) void[^{]*?\b\w+\(([^()]*)\)\s*\{", code)
+    assert len(headers) >= 2, "no kernel or nested function found"
+    for header in headers:
+        assert not re.search(r"\bC\b", header), header
+    assert len(re.findall(r"constexpr double C\[3\]", code)) >= 2  # the kernel's and the nested function's
+
+
 if __name__ == "__main__":
     test_nsdfg_input()
     test_tasklet_input_cpu()
     test_nsdfg_holding_its_input_as_constant()
+    test_gpu_kernel_reading_constant_in_tasklet()
+    test_gpu_kernel_reading_constant_in_nested_sdfg()

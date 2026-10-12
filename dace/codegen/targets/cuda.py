@@ -68,6 +68,10 @@ def cpu_to_gpu_cpred(sdfg, state, src_node, dst_node):
     """
     if isinstance(sdfg.arrays[src_node.data], dt.Scalar):
         return False
+    # A compile-time constant is emitted into every kernel as a constexpr array of its own
+    # (``generate_constants``): the kernel reads that, not the host container.
+    if src_node.data in sdfg.constants_prop:
+        return False
     return True
 
 
@@ -289,7 +293,10 @@ class CUDACodeGen(TargetCodeGenerator):
                     and node.map.schedule in (dtypes.ScheduleType.GPU_Device, dtypes.ScheduleType.GPU_Persistent)):
                 if state.parent not in shared_transients:
                     shared_transients[state.parent] = state.parent.shared_transients()
-                self._arglists[node] = state.scope_subgraph(node).arglist(defined_syms, shared_transients[state.parent])
+                arglist = state.scope_subgraph(node).arglist(defined_syms, shared_transients[state.parent])
+                # A compile-time constant is emitted into the kernel itself (``generate_constants``), not passed:
+                # a parameter of the same name would clash with that declaration.
+                self._arglists[node] = {k: v for k, v in arglist.items() if k not in state.sdfg.constants_prop}
 
     def _compute_pool_release(self, top_sdfg: SDFG):
         """
