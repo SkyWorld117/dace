@@ -2609,7 +2609,10 @@ def _specialize_scalar_impl(root: 'dace.SDFG', sdfg: 'dace.SDFG', scalars: Dict[
             return repr(float(value))
         return str(value)
 
-    def repl_code_block_or_str(input: Union[CodeBlock, str], repl: Dict[str, str]):
+    def repl_code_block_or_str(input: Optional[Union[CodeBlock, str]], repl: Dict[str, str]):
+        # A loop without an init or update statement (a while loop) holds None there: nothing to rewrite.
+        if input is None:
+            return None
         if isinstance(input, CodeBlock):
             return CodeBlock(_token_replace_all(input.as_string, repl))
         for src, dst in repl.items():
