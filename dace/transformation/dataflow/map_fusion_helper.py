@@ -534,6 +534,7 @@ def find_happens_before_connection(
     state: dace.SDFGState,
     first_map_entry: nodes.MapEntry,
     second_map_entry: nodes.MapEntry,
+    into_sources: bool = False,
 ) -> Optional[List[graph.MultiConnectorEdge[dace.Memlet]]]:
     """The empty Memlets that are the *only* connection between the two Map scopes.
 
@@ -546,14 +547,16 @@ def find_happens_before_connection(
     The function returns the ordering edges if, and only if, `first_map_entry` is the
     upstream Map and every connection to `second_map_entry` is an empty Memlet that
     goes *directly* from the first Map (its MapExit, or an AccessNode that only the
-    first Map writes) into `second_map_entry` (or into an AccessNode that nothing
-    writes and only the second Map reads). In every other case -- the Maps are
+    first Map writes) into `second_map_entry` -- or, with `into_sources`, into an
+    AccessNode that nothing writes and only the second Map reads, where
+    `StateFusionExtended` puts it. In every other case -- the Maps are
     parallel, the direction is reversed, real data flows between them, or a third node
     sits in between and would lose its own ordering -- `None` is returned.
 
     :param state: The state in which the two Maps are.
     :param first_map_entry: Entry of the Map that must be the upstream one.
     :param second_map_entry: Entry of the Map that must be the downstream one.
+    :param into_sources: Also accept ordering edges that end on a source node of the second Map.
     """
     first_map_exit: Optional[nodes.MapExit] = safe_exit_node(state, first_map_entry)
     second_map_exit: Optional[nodes.MapExit] = safe_exit_node(state, second_map_entry)
@@ -586,7 +589,8 @@ def find_happens_before_connection(
     own_inputs: Set[nodes.Node] = {
         e.src
         for e in state.in_edges(second_map_entry)
-        if isinstance(e.src, nodes.AccessNode)
+        if into_sources
+        and isinstance(e.src, nodes.AccessNode)
         and all(oe.dst is second_map_entry for oe in state.out_edges(e.src))
         and all(ie.data is not None and ie.data.is_empty() for ie in state.in_edges(e.src))
     }
@@ -780,6 +784,7 @@ def analyze_happens_before_fusion(
     first_map_entry: nodes.MapEntry,
     second_map_entry: nodes.MapEntry,
     param_repl: Dict[str, str],
+    into_sources: bool = False,
 ) -> Optional[Tuple[List[graph.MultiConnectorEdge[dace.Memlet]], List[Tuple[nodes.Node, nodes.Node]]]]:
     """Plan the fusion of two Maps that are ordered by happens-before edges only.
 
@@ -795,8 +800,9 @@ def analyze_happens_before_fusion(
     :param first_map_entry: Entry of the upstream Map.
     :param second_map_entry: Entry of the downstream Map.
     :param param_repl: Renaming of the second Map's parameters, see `find_parameter_remapping()`.
+    :param into_sources: See `find_happens_before_connection()`.
     """
-    ordering_edges = find_happens_before_connection(state, first_map_entry, second_map_entry)
+    ordering_edges = find_happens_before_connection(state, first_map_entry, second_map_entry, into_sources)
     if ordering_edges is None:
         return None
 

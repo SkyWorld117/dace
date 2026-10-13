@@ -511,7 +511,10 @@ def test_horizontal_fusion_through_the_ordering_edge_of_a_state_fusion(overlap: 
     ordering = [e for e in state.edges() if e.data.is_empty()]
     assert len(ordering) == 1 and isinstance(ordering[0].dst, nodes.AccessNode) and ordering[0].dst.data == "B"
 
-    fused = sdfg.apply_transformations_repeated(dftrans.MapFusionHorizontal, validate_all=True)
+    assert sdfg.apply_transformations_repeated(dftrans.MapFusionHorizontal, validate_all=True) == 0  # off by default
+    fused = sdfg.apply_transformations_repeated(
+        dftrans.MapFusionHorizontal, options={"ordering_edges_into_sources": True}, validate_all=True
+    )
     assert fused == (0 if overlap else 1)
     assert count_nodes(state, nodes.MapEntry) == (2 if overlap else 1)
 
