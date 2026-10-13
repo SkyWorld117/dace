@@ -373,4 +373,31 @@ def test_ordering_edge_does_not_start_a_version():
     A = np.array([3.0], dtype=np.float64)
     out = np.zeros(1, dtype=np.float64)
     sdfg(A=A, out=out)
-    assert out[0] == 6.0, f'got {out[0]}'
+    assert out[0] == 6.0, f"got {out[0]}"
+
+
+def test_scalar_fission_renames_through_a_map_scope():
+    """A scalar version read inside a map: the memlets through the map entry are renamed with the access node."""
+    sdfg = dace.SDFG("fission_through_scope")
+    sdfg.add_scalar("s", dace.float64, transient=True)
+    sdfg.add_array("out1", [4], dace.float64)
+    sdfg.add_array("out2", [4], dace.float64)
+    for k, out in enumerate(["out1", "out2"]):
+        state = sdfg.add_state(f"s{k}", is_start_block=(k == 0))
+        if k == 1:
+            sdfg.add_edge(sdfg.node(0), state, dace.InterstateEdge())
+        w = state.add_tasklet(f"w{k}", {}, {"o"}, f"o = {k + 1}.0")
+        s_node = state.add_access("s")
+        state.add_edge(w, "o", s_node, None, dace.Memlet("s[0]"))
+        me, mx = state.add_map(f"m{k}", {"i": "0:4"})
+        t = state.add_tasklet(f"t{k}", {"v"}, {"r"}, "r = v * 2")
+        state.add_memlet_path(s_node, me, t, dst_conn="v", memlet=dace.Memlet("s[0]"))
+        state.add_memlet_path(t, mx, state.add_write(out), src_conn="r", memlet=dace.Memlet(f"{out}[i]"))
+    sdfg.validate()
+    Pipeline([ScalarFission()]).apply_pass(sdfg, {})
+    sdfg.validate()
+    names = {n.data for st in sdfg.states() for n in st.data_nodes()}
+    assert len(names - {"out1", "out2"}) == 2  # one scalar per version, consistently named through the scopes
+    out1, out2 = np.zeros(4), np.zeros(4)
+    sdfg(out1=out1, out2=out2)
+    assert np.allclose(out1, 2.0) and np.allclose(out2, 4.0)
