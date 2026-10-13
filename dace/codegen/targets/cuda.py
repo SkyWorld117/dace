@@ -3334,4 +3334,10 @@ def _get_const_params(dfg_scope):
     toplevel_params = set(node.data for node in dfg_scope.nodes()
                           if isinstance(node, nodes.AccessNode) and sdfg.arrays[node.data].toplevel)
     dynamic_inputs = set(e.data.data for e in dace.sdfg.dynamic_map_inputs(state, scope_entry))
-    return input_params - (output_params | toplevel_params | dynamic_inputs)
+    # An array written inside the scope (an access node with incoming edges: an in-place update of a global array
+    # whose last write has no path to the exit) is not constant either.
+    written_inside = set(
+        node.data for node in dfg_scope.nodes()
+        if isinstance(node, nodes.AccessNode) and node is not scope_entry and state.in_degree(node) > 0
+    )
+    return input_params - (output_params | toplevel_params | dynamic_inputs | written_inside)
