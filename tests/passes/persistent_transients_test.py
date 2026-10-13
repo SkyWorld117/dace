@@ -198,6 +198,25 @@ def test_transient_of_a_nested_sdfg_inside_a_map_is_not_promoted():
     assert nest.arrays["buf"].lifetime == dace.AllocationLifetime.Scope
 
 
+def test_transient_used_inside_maps_of_two_states_is_not_promoted():
+    """Inside a map in each of two states and nowhere else: per-iteration scratch, which a later
+    transformation may turn into per-thread storage, so it keeps its Scope lifetime."""
+    sdfg = map_writing_transient_inside("persist_two_maps", also_read_outside=False)
+    first = sdfg.start_block
+    second = sdfg.add_state_after(first, "again")
+    entry, exit_ = second.add_map("m2", {"i": "0:N"})
+    writer = second.add_tasklet("w2", {"x"}, {"y"}, "y = x + 1.0")
+    second.add_memlet_path(second.add_read("a"), entry, writer, dst_conn="x", memlet=dace.Memlet("a[i]"))
+    inner = second.add_access("buf")
+    second.add_edge(writer, "y", inner, None, dace.Memlet("buf[i]"))
+    reader = second.add_tasklet("r2", {"x"}, {"y"}, "y = x")
+    second.add_edge(inner, None, reader, "x", dace.Memlet("buf[i]"))
+    second.add_memlet_path(reader, exit_, second.add_write("out"), src_conn="y", memlet=dace.Memlet("out[i]"))
+    sdfg.validate()
+    assert MakeTransientsPersistent().apply_pass(sdfg, {}) is None
+    assert sdfg.arrays["buf"].lifetime == dace.AllocationLifetime.Scope
+
+
 if __name__ == "__main__":
     test_free_symbol_sized_transient_is_promoted()
     test_the_auto_optimize_helper_delegates()
@@ -209,3 +228,4 @@ if __name__ == "__main__":
     test_transient_also_used_outside_its_map_is_promoted()
     test_transient_used_only_inside_one_map_is_not_promoted()
     test_transient_of_a_nested_sdfg_inside_a_map_is_not_promoted()
+    test_transient_used_inside_maps_of_two_states_is_not_promoted()

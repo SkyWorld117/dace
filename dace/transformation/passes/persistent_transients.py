@@ -169,10 +169,12 @@ class MakeTransientsPersistent(ppl.Pass):
         """The names whose single allocation every scope using them shares.
 
         A Scope allocation sits in the innermost scope that encloses all access nodes of the name.
-        Once two of them are in different states, or one is outside every scope of its state,
-        that is the state or the SDFG, so the threads of a map that also accesses the name already
-        share one buffer, and a persistent one changes nothing for them. This holds only where
-        ``nsdfg`` itself runs once per call: inside a map, each of its executions allocates anew.
+        Once one of them is outside every scope of its state, that is the state or the SDFG, so
+        the threads of a map that also accesses the name already share one buffer, and a
+        persistent one changes nothing for them. A name accessed only inside maps stays private
+        to them even across states: a later transformation may give it per-thread storage (the
+        GPU transformation makes such transients registers). This holds only where ``nsdfg``
+        itself runs once per call: inside a map, each of its executions allocates anew.
         """
         if any(xfh.get_parent_map(state) is not None for state in nsdfg.states()):
             return set()
@@ -184,6 +186,4 @@ class MakeTransientsPersistent(ppl.Pass):
                 while outer is not None and scope[outer] is not None:
                     outer = scope[outer]
                 sites.setdefault(dnode.data, set()).add((state, outer))
-        return {
-            name for name, where in sites.items() if len(where) > 1 or any(outer is None for _, outer in where)
-        }
+        return {name for name, where in sites.items() if any(outer is None for _, outer in where)}
