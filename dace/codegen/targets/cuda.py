@@ -1693,9 +1693,10 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
     def generate_scope(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg_scope: StateSubgraphView, state_id: int,
                        function_stream: CodeIOStream, callsite_stream: CodeIOStream) -> None:
         scope_entry = dfg_scope.source_nodes()[0]
-        scope_exit = dfg_scope.sink_nodes()[0]
-
         state = cfg.state(state_id)
+        # The map's own exit: a sink of the scope subgraph may be an access node inside the kernel (a tile buffer
+        # written and consumed within it), and the instrumentation of the exit needs the exit node.
+        scope_exit = state.exit_node(scope_entry)
 
         # If in device-level code, call appropriate function
         if (self._kernel_map is not None and self._kernel_map.map.schedule in dtypes.GPU_SCHEDULES):
