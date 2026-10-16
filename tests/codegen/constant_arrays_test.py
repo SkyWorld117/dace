@@ -98,6 +98,35 @@ def test_gpu_kernel_reading_constant_in_nested_sdfg():
     assert len(re.findall(r"constexpr double C\[3\]", code)) >= 2  # the kernel's and the nested function's
 
 
+
+def test_constant_of_a_nested_sdfg_in_a_gpu_kernel_generates():
+    """A constant array transient in a nested SDFG inside a kernel is a constexpr there: collecting the kernel's
+    arguments looked up where it is allocated (it is not) and raised a KeyError (MFC's chemistry, the molecular
+    weights in its reaction rates)."""
+    inner = dace.SDFG("weights_body")
+    inner.add_array("x", [4], dace.float64)
+    inner.add_array("y", [4], dace.float64)
+    inner.add_symbol("i", dace.int64)
+    inner.add_transient("W", [4], dace.float64)
+    inner.add_constant("W", np.array([1.0, 2.0, 3.0, 4.0]), inner.arrays["W"])
+    st = inner.add_state("body")
+    t = st.add_tasklet("scale", {"a", "w"}, {"b"}, "b = a * w")
+    st.add_edge(st.add_read("x"), None, t, "a", dace.Memlet("x[i]"))
+    st.add_edge(st.add_read("W"), None, t, "w", dace.Memlet("W[i]"))
+    st.add_edge(t, "b", st.add_write("y"), None, dace.Memlet("y[i]"))
+
+    sdfg = dace.SDFG("nested_constant_in_kernel")
+    sdfg.add_array("x", [4], dace.float64, storage=dace.StorageType.GPU_Global)
+    sdfg.add_array("y", [4], dace.float64, storage=dace.StorageType.GPU_Global)
+    state = sdfg.add_state()
+    entry, exit_ = state.add_map("k", {"i": "0:4"}, schedule=dace.ScheduleType.GPU_Device)
+    node = state.add_nested_sdfg(inner, {"x"}, {"y"}, {"i": "i"})
+    state.add_memlet_path(state.add_read("x"), entry, node, dst_conn="x", memlet=dace.Memlet("x[0:4]"))
+    state.add_memlet_path(node, exit_, state.add_write("y"), src_conn="y", memlet=dace.Memlet("y[0:4]"))
+    sdfg.validate()
+    code = sdfg.generate_code()
+    assert any("W" in c.clean_code for c in code)
+
 if __name__ == "__main__":
     test_nsdfg_input()
     test_tasklet_input_cpu()

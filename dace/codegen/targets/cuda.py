@@ -1765,6 +1765,9 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
                 if (nsdfg, node.data) in visited:
                     continue
                 visited.add((nsdfg, node.data))
+                # A constant is a constexpr array emitted where it is used, never allocated: nothing to pass.
+                if node.data in nsdfg.constants:
+                    continue
                 if desc.transient and self._frame.where_allocated[(nsdfg, node.data)] is not nsdfg:
                     outer_name = self.ptr(node.data, desc, nsdfg)
 
