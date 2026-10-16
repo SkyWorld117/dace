@@ -4,7 +4,7 @@
 from collections import defaultdict
 import copy
 import sympy as sp
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 import warnings
 
 from dace import data as dt, dtypes, memlet, nodes, sdfg as sd, symbolic, subsets, properties
@@ -18,6 +18,14 @@ import dace.transformation.helpers as helpers
 from dace.transformation import transformation as xf
 from dace.transformation.passes.analysis import loop_analysis
 from ordered_set import OrderedSet
+
+
+def _enclosing_loop(block) -> Optional[LoopRegion]:
+    """The innermost loop region that holds ``block``."""
+    region = block.parent_graph
+    while region is not None and not isinstance(region, LoopRegion):
+        region = region.parent_graph
+    return region
 
 
 def _check_range(subset, a, itersym, b, step):
@@ -312,9 +320,12 @@ class LoopToMap(xf.MultiStateTransformation):
         if not t in dtypes.INTEGER_TYPES:
             return False
 
-        # Loops containing break, continue, or returns may not be turned into a map.
+        # Loops containing returns, or a break or continue of their own, may not be turned into a map. A break or
+        # continue of an inner loop leaves only that loop.
         for blk in self.loop.all_control_flow_blocks():
-            if isinstance(blk, (BreakBlock, ContinueBlock, ReturnBlock)):
+            if isinstance(blk, ReturnBlock):
+                return False
+            if isinstance(blk, (BreakBlock, ContinueBlock)) and _enclosing_loop(blk) is self.loop:
                 return False
 
         # We cannot handle symbols read from data containers unless they are scalar.
