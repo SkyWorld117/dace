@@ -383,16 +383,18 @@ class ConstantPropagation(ppl.Pass):
                             assignments[aname] = aval
 
                 for edge in cfg.out_edges(block):
+                    edge_value_symbols = {
+                        k: symbolic.free_symbols_and_functions(v) for k, v in edge.data.assignments.items()
+                    }
                     for aname, aval in assignments.items():
-                        # If the specific replacement would result in the value being both used and reassigned on the
-                        # same inter-state edge, remove it from consideration.
-                        replacements = symbolic.free_symbols_and_functions(aval)
-                        used_in_assignments = {
-                            k
-                            for k, v in edge.data.assignments.items() if aname in symbolic.free_symbols_and_functions(v)
-                        }
-                        reassignments = replacements & edge.data.assignments.keys()
-                        if reassignments and (used_in_assignments - reassignments):
+                        # If the specific replacement would put a symbol this edge reassigns into the right-hand side
+                        # of another of its assignments (an assignment may read only its own target among them),
+                        # remove it from consideration.
+                        reassignments = symbolic.free_symbols_and_functions(aval) & edge.data.assignments.keys()
+                        if not reassignments:
+                            continue
+                        used_in_assignments = {k for k, fsyms in edge_value_symbols.items() if aname in fsyms}
+                        if any(reassignments - {k} for k in used_in_assignments):
                             assignments[aname] = _UnknownValue
 
                 if isinstance(block, LoopRegion):

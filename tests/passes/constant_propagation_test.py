@@ -632,7 +632,32 @@ def test_dependency_change_same_edge(extra_state):
     assert a[0] == ref
 
 
-if __name__ == '__main__':
+def test_dependency_change_same_edge_all_reassigned():
+    """
+    A constant whose expression reads symbols an edge reassigns is not propagated into that edge's assignments:
+    with ``n = x + y`` known, ``x = x * n; y = y * n`` would become assignments each reading the other's target.
+    """
+    sdfg = dace.SDFG("tester")
+    sdfg.add_symbol("x", dace.int64)
+    sdfg.add_symbol("y", dace.int64)
+    sdfg.add_array("a", [1], dace.int64)
+    init = sdfg.add_state(is_start_block=True)
+    scaled = sdfg.add_state("scaled")
+    body = sdfg.add_state("body")
+    sdfg.add_edge(init, scaled, dace.InterstateEdge(assignments=dict(n="x + y")))
+    sdfg.add_edge(scaled, body, dace.InterstateEdge(assignments=dict(x="x * n", y="y * n")))
+    t = body.add_tasklet("add", {}, {"out"}, "out = x + y")
+    body.add_edge(t, "out", body.add_write("a"), None, dace.Memlet("a[0]"))
+
+    ConstantPropagation().apply_pass(sdfg, {})
+
+    sdfg.validate()
+    a = np.zeros([1], np.int64)
+    sdfg(a=a, x=2, y=3)
+    assert a[0] == 2 * 5 + 3 * 5
+
+
+if __name__ == "__main__":
     test_simple_constants()
     test_nested_constants()
     test_simple_loop()
@@ -653,3 +678,4 @@ if __name__ == '__main__':
     test_dependency_change()
     test_dependency_change_same_edge(False)
     test_dependency_change_same_edge(True)
+    test_dependency_change_same_edge_all_reassigned()
