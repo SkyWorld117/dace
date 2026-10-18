@@ -2088,12 +2088,16 @@ def move_branch_cfg_up_discard_conditions(if_block: ConditionalBlock, body_to_ta
     node_map = dict()
     new_start_block = None
     new_end_block = None
+    # Settled before any node is spliced in: a copied end block has no in-edges yet, so the parent's start block
+    # would be ambiguous while the copies are added.
+    if_block_starts_graph = graph.start_block == if_block
+    body_start = body_to_take.start_block
 
     for node in body_to_take.nodes():
         copynode = copy.deepcopy(node)
         node_map[node] = copynode
-        start_block_case = (body_to_take.start_block == node) and (graph.start_block == if_block)
-        if body_to_take.start_block == node:
+        start_block_case = (body_start == node) and if_block_starts_graph
+        if body_start == node:
             assert new_start_block is None
             new_start_block = copynode
         if body_to_take.out_degree(node) == 0:
