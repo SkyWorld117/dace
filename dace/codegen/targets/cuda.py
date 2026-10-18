@@ -465,10 +465,11 @@ int __dace_init_cuda({sdfg_state_name} *__state{params}) {{
     }}
 
     // One GPU per process, selected here and never changed, so the memory pool, every kernel and
-    // every library handle share it. Which physical GPU is the process's business: the visible-
-    // devices variable renumbers what it exposes, so a rank's own GPU is device 0. An ordinal
-    // fixed at codegen time cannot do that -- every rank shares one build.
-    const int __dace_device = 0;
+    // every library handle share it. Which physical GPU is the process's business: the one it has
+    // selected already (an MPI rank's own, by its launcher's variable or its own call), else the
+    // first. An ordinal fixed at codegen time cannot do that -- every rank shares one build.
+    int __dace_device = 0;
+    if ({backend}GetDevice(&__dace_device) != {backend}Success) __dace_device = 0;
     if ({backend}SetDevice(__dace_device) != {backend}Success)
     {{
         printf("ERROR: could not select {backend} device 0 out of %d visible\\n", count);
