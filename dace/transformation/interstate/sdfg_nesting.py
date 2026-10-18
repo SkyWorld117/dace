@@ -215,9 +215,13 @@ class InlineSDFG(transformation.SingleStateTransformation):
         if graph.entry_node(nested_sdfg) is not None:
             all_connectors = in_connectors | out_connectors
             nstate = nested_sdfg.sdfg.node(0)
+            # Only top-level nodes are reconnected to the outer scope; a node inside a map of the nested state
+            # stays an ordinary node of the outer container, its reads included.
+            scopes = nstate.scope_dict()
             for node in nstate.nodes():
                 if isinstance(node, nodes.AccessNode):
                     if (node.data in out_connectors and node.data not in shared_connectors
+                            and scopes[node] is None
                             and nstate.out_degree(node) > 0
                             and (node.data not in in_connectors or nstate.in_degree(node) > 0)):
                         return False
