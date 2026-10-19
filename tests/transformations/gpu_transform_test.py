@@ -270,18 +270,19 @@ def _program_with_two_ordered_free_tasklets() -> dace.SDFG:
     state.add_edge(state.add_read("A"), None, second, "inp", dace.Memlet("A[1]"))
     state.add_edge(second, "out", state.add_write("B"), None, dace.Memlet("B[1]"))
     state.add_nedge(first, second, dace.Memlet())  # the source ordered the two statements
-    body = dace.SDFG("body")
-    body.add_scalar("a", dace.float64)
-    body.add_scalar("b", dace.float64)
+    body = dace.SDFG("body")  # the connectors describe the outer containers; the body indexes them with i
+    body.add_array("a", [4], dace.float64)
+    body.add_array("b", [4], dace.float64)
+    body.add_symbol("i", dace.int32)
     bstate = body.add_state()
     bt = bstate.add_tasklet("t", {"x"}, {"y"}, "y = x + 2")
-    bstate.add_edge(bstate.add_read("a"), None, bt, "x", dace.Memlet("a"))
-    bstate.add_edge(bt, "y", bstate.add_write("b"), None, dace.Memlet("b"))
+    bstate.add_edge(bstate.add_read("a"), None, bt, "x", dace.Memlet("a[i]"))
+    bstate.add_edge(bt, "y", bstate.add_write("b"), None, dace.Memlet("b[i]"))
     mstate = sdfg.add_state_after(state)
-    nested = mstate.add_nested_sdfg(body, {"a"}, {"b"})
+    nested = mstate.add_nested_sdfg(body, {"a"}, {"b"}, symbol_mapping={"i": "i"})
     me, mx = mstate.add_map("m", {"i": "0:4"})
-    mstate.add_memlet_path(mstate.add_read("A"), me, nested, dst_conn="a", memlet=dace.Memlet("A[i]"))
-    mstate.add_memlet_path(nested, mx, mstate.add_write("B"), src_conn="b", memlet=dace.Memlet("B[i]"))
+    mstate.add_memlet_path(mstate.add_read("A"), me, nested, dst_conn="a", memlet=dace.Memlet("A[0:4]"))
+    mstate.add_memlet_path(nested, mx, mstate.add_write("B"), src_conn="b", memlet=dace.Memlet("B[0:4]"))
     return sdfg
 
 
