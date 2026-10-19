@@ -316,6 +316,35 @@ def test_the_transformation_applies_to_the_given_sdfg_not_to_a_nested_one():
     assert not any(name.startswith("gpu_") for name in nested.sdfg.arrays)
 
 
+def test_a_scalar_a_late_kernel_tasklet_writes_goes_to_the_device():
+    """A free tasklet reads a transient array (on the device only after the transients move) and writes a transient
+    scalar; a second one reads that scalar into a device array. Both become one-thread kernels, and the scalar
+    between them lives on the device: a kernel cannot write host memory."""
+    sdfg = dace.SDFG("late_kernel_scalar")
+    sdfg.add_array("A", [4], dace.float64)
+    sdfg.add_array("B", [4], dace.float64)
+    sdfg.add_transient("tmp", [4], dace.float64)
+    sdfg.add_scalar("s", dace.float64, transient=True)
+    state = sdfg.add_state()
+    state.add_mapped_tasklet("fill", {"i": "0:4"}, {"a": dace.Memlet("A[i]")}, "t = a * 2", {"t": dace.Memlet("tmp[i]")},
+                             external_edges=True)
+    tmp = next(n for n in state.nodes() if isinstance(n, dace.nodes.AccessNode) and n.data == "tmp")
+    first = state.add_tasklet("first", {"x"}, {"y"}, "y = x + 1")
+    state.add_edge(tmp, None, first, "x", dace.Memlet("tmp[0]"))
+    s_node = state.add_access("s")
+    state.add_edge(first, "y", s_node, None, dace.Memlet("s"))
+    second = state.add_tasklet("second", {"x"}, {"y"}, "y = x * 3")
+    state.add_edge(s_node, None, second, "x", dace.Memlet("s"))
+    state.add_edge(second, "y", state.add_write("B"), None, dace.Memlet("B[0]"))
+
+    sdfg.apply_gpu_transformations()
+    sdfg.validate()
+    assert sdfg.arrays["s"].storage == dace.StorageType.GPU_Global
+    kernels = {n.label for n in state.nodes() if isinstance(n, dace.nodes.MapEntry)
+               and n.map.schedule == dace.ScheduleType.GPU_Device}
+    assert {"first_gmap", "second_gmap"} <= kernels
+
+
 if __name__ == "__main__":
     test_toplevel_transient_lifetime()
     test_scalar_to_symbol_in_nested_sdfg()
