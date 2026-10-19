@@ -255,6 +255,66 @@ def test_free_tasklet_with_an_ordering_edge():
     assert any(e.data.is_empty() for e in state.out_edges(exit_node))
 
 
+def _program_with_two_ordered_free_tasklets() -> dace.SDFG:
+    """Two free tasklets at the top level joined by an ordering edge (an empty memlet), and a map whose body is a
+    nested SDFG."""
+    sdfg = dace.SDFG("ordered_free_tasklets")
+    sdfg.add_array("A", [4], dace.float64)
+    sdfg.add_array("B", [4], dace.float64)
+    sdfg.add_scalar("s", dace.float64, transient=True)
+    state = sdfg.add_state()
+    first = state.add_tasklet("first", {"inp"}, {"out"}, "out = inp + 1")
+    second = state.add_tasklet("second", {"inp"}, {"out"}, "out = inp * 2")
+    state.add_edge(state.add_read("A"), None, first, "inp", dace.Memlet("A[0]"))
+    state.add_edge(first, "out", state.add_write("s"), None, dace.Memlet("s"))
+    state.add_edge(state.add_read("A"), None, second, "inp", dace.Memlet("A[1]"))
+    state.add_edge(second, "out", state.add_write("B"), None, dace.Memlet("B[1]"))
+    state.add_nedge(first, second, dace.Memlet())  # the source ordered the two statements
+    body = dace.SDFG("body")
+    body.add_array("a", [1], dace.float64)
+    body.add_array("b", [1], dace.float64)
+    bstate = body.add_state()
+    bt = bstate.add_tasklet("t", {"x"}, {"y"}, "y = x + 2")
+    bstate.add_edge(bstate.add_read("a"), None, bt, "x", dace.Memlet("a[0]"))
+    bstate.add_edge(bt, "y", bstate.add_write("b"), None, dace.Memlet("b[0]"))
+    mstate = sdfg.add_state_after(state)
+    nested = mstate.add_nested_sdfg(body, {"a"}, {"b"})
+    me, mx = mstate.add_map("m", {"i": "0:4"})
+    mstate.add_memlet_path(mstate.add_read("A"), me, nested, dst_conn="a", memlet=dace.Memlet("A[i]"))
+    mstate.add_memlet_path(nested, mx, mstate.add_write("B"), src_conn="b", memlet=dace.Memlet("B[i]"))
+    return sdfg
+
+
+def test_ordering_edge_between_free_tasklets_does_not_block_the_transformation():
+    """Two top-level tasklets joined by an empty memlet only order each other: the transformation applies (each
+    becomes a one-thread kernel, the edge passes between them) instead of refusing the SDFG as it does for a
+    memlet carrying data between two tasklets."""
+    sdfg = _program_with_two_ordered_free_tasklets()
+    sdfg.apply_gpu_transformations()
+    sdfg.validate()
+    state = sdfg.start_state
+    kernels = [n for n in state.nodes() if isinstance(n, dace.nodes.MapEntry)]
+    assert len(kernels) == 2 and all(k.map.schedule == dace.ScheduleType.GPU_Device for k in kernels)
+
+
+def test_the_transformation_applies_to_the_given_sdfg_not_to_a_nested_one():
+    """When the SDFG itself cannot take the transformation (a memlet carrying data between two top-level tasklets),
+    apply_gpu_transformations says so instead of transforming the body of one of its maps as if it were a program
+    of its own."""
+    sdfg = _program_with_two_ordered_free_tasklets()
+    state = sdfg.start_state
+    first, second = (n for n in state.nodes() if isinstance(n, dace.nodes.Tasklet))
+    for e in list(state.edges_between(first, second)):
+        state.remove_edge(e)
+    first.add_out_connector("link")
+    second.add_in_connector("link")
+    state.add_edge(first, "link", second, "link", dace.Memlet("s"))
+    nested = next(n for n in sdfg.all_nodes_recursive() if isinstance(n[0], dace.nodes.NestedSDFG))[0]
+    with pytest.raises(ValueError):
+        sdfg.apply_gpu_transformations()
+    assert not any(name.startswith("gpu_") for name in nested.sdfg.arrays)
+
+
 if __name__ == "__main__":
     test_toplevel_transient_lifetime()
     test_scalar_to_symbol_in_nested_sdfg()
@@ -267,3 +327,5 @@ if __name__ == "__main__":
     test_gpu_local_storage_of_a_nested_sdfg_row()
     test_an_interstate_condition_reading_a_gpu_map_output_reads_a_host_copy()
     test_free_tasklet_with_an_ordering_edge()
+    test_ordering_edge_between_free_tasklets_does_not_block_the_transformation()
+    test_the_transformation_applies_to_the_given_sdfg_not_to_a_nested_one()

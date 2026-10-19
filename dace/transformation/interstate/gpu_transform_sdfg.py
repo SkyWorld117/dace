@@ -158,10 +158,11 @@ class GPUTransformSDFG(transformation.MultiStateTransformation):
         for state in sdfg.states():
             schildren = state.scope_children()
             for node in schildren[None]:
-                # If two top-level tasklets are connected with a code->code
-                # memlet, they will transform into an invalid SDFG
+                # If two top-level tasklets are connected with a code->code memlet, they will transform into an
+                # invalid SDFG. An empty memlet only orders the two; the kernel wrapping passes it through.
                 if (isinstance(node, nodes.CodeNode)
-                        and any(isinstance(e.dst, nodes.CodeNode) for e in state.out_edges(node))):
+                        and any(isinstance(e.dst, nodes.CodeNode) and not e.data.is_empty()
+                                for e in state.out_edges(node))):
                     return False
         return True
 
