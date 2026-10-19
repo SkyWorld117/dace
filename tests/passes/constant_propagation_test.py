@@ -657,6 +657,41 @@ def test_dependency_change_same_edge_all_reassigned():
     assert a[0] == 2 * 5 + 3 * 5
 
 
+def test_dependency_change_same_edge_inside_a_branch():
+    """
+    The same rule where the edge sits at the start of a conditional branch: there the constant arrives as the
+    branch's entry value rather than over an in-edge of the block. With ``m = sqrt(x*x + y*y)`` known, the branch
+    ``if m > 0: x = x / m; y = y / m`` keeps ``m``'s own assignment instead of reading the other's target.
+    """
+    sdfg = dace.SDFG("tester")
+    sdfg.add_symbol("x", dace.float64)
+    sdfg.add_symbol("y", dace.float64)
+    sdfg.add_symbol("m", dace.float64)
+    sdfg.add_array("a", [2], dace.float64)
+    init = sdfg.add_state(is_start_block=True)
+    known = sdfg.add_state("known")
+    sdfg.add_edge(init, known, dace.InterstateEdge(assignments=dict(m="sqrt(x * x + y * y)")))
+    if_region = dace.sdfg.state.ConditionalBlock("if")
+    sdfg.add_node(if_region)
+    sdfg.add_edge(known, if_region, dace.InterstateEdge())
+    branch = dace.sdfg.state.ControlFlowRegion("scale", sdfg=sdfg)
+    if_region.add_branch(dace.sdfg.state.CodeBlock("m > 0"), branch)
+    first = branch.add_state("first", is_start_block=True)
+    scaled = branch.add_state("scaled")
+    branch.add_edge(first, scaled, dace.InterstateEdge(assignments=dict(x="x / m", y="y / m")))
+    body = sdfg.add_state("body")
+    sdfg.add_edge(if_region, body, dace.InterstateEdge())
+    t = body.add_tasklet("store", {}, {"out"}, "out[0] = x; out[1] = y")
+    body.add_edge(t, "out", body.add_write("a"), None, dace.Memlet("a[0:2]"))
+
+    ConstantPropagation().apply_pass(sdfg, {})
+
+    sdfg.validate()
+    a = np.zeros([2], np.float64)
+    sdfg(a=a, x=3.0, y=4.0)
+    assert np.allclose(a, [0.6, 0.8])
+
+
 if __name__ == "__main__":
     test_simple_constants()
     test_nested_constants()
