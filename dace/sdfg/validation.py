@@ -1041,8 +1041,11 @@ class InvalidSDFGInterstateEdgeError(InvalidSDFGError):
         return dict(message=self.message, cfg_id=self.sdfg.cfg_id, isedge_id=self.edge_id)
 
     def __str__(self):
-        if self.edge_id is not None:
-            e = self.sdfg.edges()[self.edge_id]
+        try:
+            e = self.sdfg.edges()[self.edge_id] if self.edge_id is not None else None
+        except (IndexError, TypeError):
+            e = None  # an edge of a nested region, or one removed since: the message still names the graph
+        if e is not None:
             edgestr = ' (at edge %s -> %s)' % (
                 str(e.src),
                 str(e.dst),
@@ -1050,7 +1053,7 @@ class InvalidSDFGInterstateEdgeError(InvalidSDFGError):
             locinfo_src = self._getlineinfo(e.src)
             locinfo_dst = self._getlineinfo(e.dst)
         else:
-            edgestr = ''
+            edgestr = '' if self.edge_id is None else ' (edge %s of %s)' % (self.edge_id, self.sdfg.label)
             locinfo_src = locinfo_dst = ''
 
         if locinfo_src or locinfo_dst:
