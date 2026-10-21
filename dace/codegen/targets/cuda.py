@@ -68,6 +68,10 @@ def cpu_to_gpu_cpred(sdfg, state, src_node, dst_node):
     """
     if isinstance(sdfg.arrays[src_node.data], dt.Scalar):
         return False
+    # A compile-time constant is emitted into every kernel as a constexpr array of its own
+    # (``generate_constants``): the kernel reads that, not the host container.
+    if src_node.data in sdfg.constants_prop:
+        return False
     return True
 
 
@@ -289,7 +293,10 @@ class CUDACodeGen(TargetCodeGenerator):
                     and node.map.schedule in (dtypes.ScheduleType.GPU_Device, dtypes.ScheduleType.GPU_Persistent)):
                 if state.parent not in shared_transients:
                     shared_transients[state.parent] = state.parent.shared_transients()
-                self._arglists[node] = state.scope_subgraph(node).arglist(defined_syms, shared_transients[state.parent])
+                arglist = state.scope_subgraph(node).arglist(defined_syms, shared_transients[state.parent])
+                # A compile-time constant is emitted into the kernel itself (``generate_constants``), not passed:
+                # a parameter of the same name would clash with that declaration.
+                self._arglists[node] = {k: v for k, v in arglist.items() if k not in state.sdfg.constants_prop}
 
     def _compute_pool_release(self, top_sdfg: SDFG):
         """
@@ -458,10 +465,11 @@ int __dace_init_cuda({sdfg_state_name} *__state{params}) {{
     }}
 
     // One GPU per process, selected here and never changed, so the memory pool, every kernel and
-    // every library handle share it. Which physical GPU is the process's business: the visible-
-    // devices variable renumbers what it exposes, so a rank's own GPU is device 0. An ordinal
-    // fixed at codegen time cannot do that -- every rank shares one build.
-    const int __dace_device = 0;
+    // every library handle share it. Which physical GPU is the process's business: the one it has
+    // selected already (an MPI rank's own, by its launcher's variable or its own call), else the
+    // first. An ordinal fixed at codegen time cannot do that -- every rank shares one build.
+    int __dace_device = 0;
+    if ({backend}GetDevice(&__dace_device) != {backend}Success) __dace_device = 0;
     if ({backend}SetDevice(__dace_device) != {backend}Success)
     {{
         printf("ERROR: could not select {backend} device 0 out of %d visible\\n", count);
@@ -1686,9 +1694,10 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
     def generate_scope(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg_scope: StateSubgraphView, state_id: int,
                        function_stream: CodeIOStream, callsite_stream: CodeIOStream) -> None:
         scope_entry = dfg_scope.source_nodes()[0]
-        scope_exit = dfg_scope.sink_nodes()[0]
-
         state = cfg.state(state_id)
+        # The map's own exit: a sink of the scope subgraph may be an access node inside the kernel (a tile buffer
+        # written and consumed within it), and the instrumentation of the exit needs the exit node.
+        scope_exit = state.exit_node(scope_entry)
 
         # If in device-level code, call appropriate function
         if (self._kernel_map is not None and self._kernel_map.map.schedule in dtypes.GPU_SCHEDULES):
@@ -1757,6 +1766,9 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
                 if (nsdfg, node.data) in visited:
                     continue
                 visited.add((nsdfg, node.data))
+                # A constant is a constexpr array emitted where it is used, never allocated: nothing to pass.
+                if node.data in nsdfg.constants:
+                    continue
                 if desc.transient and self._frame.where_allocated[(nsdfg, node.data)] is not nsdfg:
                     outer_name = self.ptr(node.data, desc, nsdfg)
 
@@ -3320,10 +3332,17 @@ def _get_const_params(dfg_scope):
     state = dfg_scope.graph
     sdfg = dfg_scope.parent
     scope_entry = dfg_scope.source_nodes()[0]
-    scope_exit = dfg_scope.sink_nodes()[0]
+    # The scope's exit node: a kernel scope may hold other sinks, such as access nodes written last.
+    scope_exit = state.exit_node(scope_entry)
     input_params = set(e.data.data for e in state.in_edges(scope_entry))
     output_params = set(e.data.data for e in state.out_edges(scope_exit))
     toplevel_params = set(node.data for node in dfg_scope.nodes()
                           if isinstance(node, nodes.AccessNode) and sdfg.arrays[node.data].toplevel)
     dynamic_inputs = set(e.data.data for e in dace.sdfg.dynamic_map_inputs(state, scope_entry))
-    return input_params - (output_params | toplevel_params | dynamic_inputs)
+    # An array written inside the scope (an access node with incoming edges: an in-place update of a global array
+    # whose last write has no path to the exit) is not constant either.
+    written_inside = set(
+        node.data for node in dfg_scope.nodes()
+        if isinstance(node, nodes.AccessNode) and node is not scope_entry and state.in_degree(node) > 0
+    )
+    return input_params - (output_params | toplevel_params | dynamic_inputs | written_inside)

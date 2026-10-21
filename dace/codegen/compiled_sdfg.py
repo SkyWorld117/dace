@@ -145,14 +145,21 @@ class ReloadableDLL(object):
                                                 'Please use a different name for the SDFG/program.')
 
         # Actually load the library
+        # Bind the diagnostic function first: looking up a symbol after a failed
+        # dlopen can overwrite the thread-local error we need to report. Older
+        # cached stubs need not expose this optional function.
+        load_error = getattr(self._stub, "get_load_error", None)
+        if load_error is not None:
+            load_error.restype = ctypes.c_char_p
         self._lib = ctypes.c_void_p(self._stub.load_library(lib_cfilename))
         self._library_filename = lib_filename
 
         if self._lib.value is None:
             # Try to understand why the library is not loading, if dynamic
             # linker is used
-            reason = ''
-            if os.name == 'posix':
+            error = load_error() if load_error is not None else None
+            reason = error.decode('utf-8', errors='replace') if error else ''
+            if not reason and os.name == 'posix':
                 result = subprocess.run(['ld', self._library_filename], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 stderr = result.stderr.decode('utf-8')
                 reason = 'Reason:\n' + '\n'.join([l for l in stderr.split('\n') if '_start' not in l])

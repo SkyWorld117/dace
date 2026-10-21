@@ -1,6 +1,8 @@
 # Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 """ Unit tests for the GPU to-device transformation. """
 
+import re
+
 import dace
 import numpy as np
 import pytest
@@ -146,7 +148,168 @@ def test_free_tasklet(transient, scalar):
     sdfg.validate()
 
 
-if __name__ == '__main__':
+@pytest.mark.gpu
+def test_an_interstate_condition_reading_a_gpu_map_output_reads_a_host_copy():
+    """A GPU map writes ``flag`` and the next interstate condition reads ``flag[0]`` on the host. The
+    transformation must register the moved array so a host copy-out precedes the reading edge;
+    without it the condition names device memory and validation rejects the SDFG."""
+    sdfg = dace.SDFG("gpu_output_gate")
+    sdfg.add_array("flag", [4], dace.int32, transient=True)
+    sdfg.add_array("A", [8], dace.float64)
+    sdfg.add_array("out", [8], dace.float64)
+    set_flag = sdfg.add_state("set_flag", is_start_block=True)
+    set_flag.add_mapped_tasklet(
+        "write_flag", {"i": "0:4"}, {}, "o = 1", {"o": dace.Memlet("flag[i]")}, external_edges=True
+    )
+    compute = sdfg.add_state("compute")
+    compute.add_mapped_tasklet(
+        "double",
+        {"j": "0:8"},
+        {"a": dace.Memlet("A[j]")},
+        "o = 2 * a",
+        {"o": dace.Memlet("out[j]")},
+        external_edges=True,
+    )
+    end = sdfg.add_state("end")
+    sdfg.add_edge(set_flag, compute, dace.InterstateEdge("flag[0] > 0"))
+    sdfg.add_edge(set_flag, end, dace.InterstateEdge("not (flag[0] > 0)"))
+    sdfg.add_edge(compute, end, dace.InterstateEdge())
+
+    sdfg.apply_transformations(GPUTransformSDFG, options=dict(simplify=False))
+
+    assert sdfg.arrays["flag"].storage == dace.StorageType.GPU_Global
+    host_copies = [
+        name
+        for name, desc in sdfg.arrays.items()
+        if name.startswith("host_flag") and desc.storage == dace.StorageType.CPU_Heap
+    ]
+    assert len(host_copies) == 1, sorted(sdfg.arrays)
+    conditions = [e.data.condition.as_string for e in sdfg.all_interstate_edges() if not e.data.is_unconditional()]
+    assert len(conditions) == 2, conditions
+    assert all(host_copies[0] in c and not re.search(r"\bflag\[", c) for c in conditions), conditions
+
+    A = np.random.rand(8)
+    out = np.zeros(8)
+    sdfg(A=A, out=out)
+    assert np.allclose(out, 2 * A)
+
+
+def test_free_tasklet_with_an_ordering_edge():
+    """A free tasklet the GPU transformation wraps in a one-thread map keeps an edge that only orders it (an empty
+    memlet, no connector): the edge passes through the map instead of the map getting a connector for it."""
+    sdfg = dace.SDFG("free_tasklet_ordering_edge")
+    sdfg.add_array("A", [4], dace.float64)
+    sdfg.add_array("B", [4], dace.float64)
+    state = sdfg.add_state()
+    a, b = state.add_read("A"), state.add_write("B")
+    tasklet = state.add_tasklet("copy", {"inp"}, {"out"}, "out = inp")
+    state.add_edge(a, None, tasklet, "inp", dace.Memlet("A[0]"))
+    state.add_edge(tasklet, "out", b, None, dace.Memlet("B[0]"))
+    state.add_nedge(tasklet, state.add_write("A"), dace.Memlet())  # orders a later use of A after the tasklet
+
+    sdfg.apply_transformations(GPUTransformSDFG)
+    sdfg.validate()
+    wrappers = [n for n in state.nodes() if isinstance(n, dace.nodes.MapEntry)]
+    assert len(wrappers) == 1
+    exit_node = state.exit_node(wrappers[0])
+    assert all(c is not None for c in exit_node.in_connectors)
+    assert any(e.data.is_empty() for e in state.out_edges(exit_node))
+
+
+def _program_with_two_ordered_free_tasklets() -> dace.SDFG:
+    """Two free tasklets at the top level joined by an ordering edge (an empty memlet), and a map whose body is a
+    nested SDFG."""
+    sdfg = dace.SDFG("ordered_free_tasklets")
+    sdfg.add_array("A", [4], dace.float64)
+    sdfg.add_array("B", [4], dace.float64)
+    sdfg.add_scalar("s", dace.float64, transient=True)
+    state = sdfg.add_state()
+    first = state.add_tasklet("first", {"inp"}, {"out"}, "out = inp + 1")
+    second = state.add_tasklet("second", {"inp"}, {"out"}, "out = inp * 2")
+    state.add_edge(state.add_read("A"), None, first, "inp", dace.Memlet("A[0]"))
+    state.add_edge(first, "out", state.add_write("s"), None, dace.Memlet("s"))
+    state.add_edge(state.add_read("A"), None, second, "inp", dace.Memlet("A[1]"))
+    state.add_edge(second, "out", state.add_write("B"), None, dace.Memlet("B[1]"))
+    state.add_nedge(first, second, dace.Memlet())  # the source ordered the two statements
+    body = dace.SDFG("body")  # the connectors describe the outer containers; the body indexes them with i
+    body.add_array("a", [4], dace.float64)
+    body.add_array("b", [4], dace.float64)
+    body.add_symbol("i", dace.int32)
+    bstate = body.add_state()
+    bt = bstate.add_tasklet("t", {"x"}, {"y"}, "y = x + 2")
+    bstate.add_edge(bstate.add_read("a"), None, bt, "x", dace.Memlet("a[i]"))
+    bstate.add_edge(bt, "y", bstate.add_write("b"), None, dace.Memlet("b[i]"))
+    mstate = sdfg.add_state_after(state)
+    nested = mstate.add_nested_sdfg(body, {"a"}, {"b"}, symbol_mapping={"i": "i"})
+    me, mx = mstate.add_map("m", {"i": "0:4"})
+    mstate.add_memlet_path(mstate.add_read("A"), me, nested, dst_conn="a", memlet=dace.Memlet("A[0:4]"))
+    mstate.add_memlet_path(nested, mx, mstate.add_write("B"), src_conn="b", memlet=dace.Memlet("B[0:4]"))
+    return sdfg
+
+
+def test_ordering_edge_between_free_tasklets_does_not_block_the_transformation():
+    """Two top-level tasklets joined by an empty memlet only order each other: the transformation applies (each
+    becomes a one-thread kernel, the edge passes between them) instead of refusing the SDFG as it does for a
+    memlet carrying data between two tasklets."""
+    sdfg = _program_with_two_ordered_free_tasklets()
+    sdfg.apply_gpu_transformations()
+    sdfg.validate()
+    # The transformation inserts a copy-in state before the original one, so the kernels are not in
+    # ``start_state``: find the state holding the two ordered tasklets.
+    state = next(s for s in sdfg.states()
+                 if any(isinstance(n, dace.nodes.Tasklet) and n.label == 'first' for n in s.nodes()))
+    kernels = [n for n in state.nodes() if isinstance(n, dace.nodes.MapEntry)]
+    assert len(kernels) == 2 and all(k.map.schedule == dace.ScheduleType.GPU_Device for k in kernels)
+
+
+def test_the_transformation_applies_to_the_given_sdfg_not_to_a_nested_one():
+    """When the SDFG itself cannot take the transformation (a memlet carrying data between two top-level tasklets),
+    apply_gpu_transformations says so instead of transforming the body of one of its maps as if it were a program
+    of its own."""
+    sdfg = _program_with_two_ordered_free_tasklets()
+    state = sdfg.start_state
+    first, second = (n for n in state.nodes() if isinstance(n, dace.nodes.Tasklet))
+    for e in list(state.edges_between(first, second)):
+        state.remove_edge(e)
+    first.add_out_connector("link")
+    second.add_in_connector("link")
+    state.add_edge(first, "link", second, "link", dace.Memlet("s"))
+    nested = next(n for n in sdfg.all_nodes_recursive() if isinstance(n[0], dace.nodes.NestedSDFG))[0]
+    with pytest.raises(ValueError):
+        sdfg.apply_gpu_transformations()
+    assert not any(name.startswith("gpu_") for name in nested.sdfg.arrays)
+
+
+def test_a_scalar_a_late_kernel_tasklet_writes_goes_to_the_device():
+    """A free tasklet reads a transient array (on the device only after the transients move) and writes a transient
+    scalar; a second one reads that scalar into a device array. Both become one-thread kernels, and the scalar
+    between them lives on the device: a kernel cannot write host memory."""
+    sdfg = dace.SDFG("late_kernel_scalar")
+    sdfg.add_array("A", [4], dace.float64)
+    sdfg.add_array("B", [4], dace.float64)
+    sdfg.add_transient("tmp", [4], dace.float64)
+    sdfg.add_scalar("s", dace.float64, transient=True)
+    state = sdfg.add_state()
+    state.add_mapped_tasklet("fill", {"i": "0:4"}, {"a": dace.Memlet("A[i]")}, "t = a * 2", {"t": dace.Memlet("tmp[i]")},
+                             external_edges=True)
+    tmp = next(n for n in state.nodes() if isinstance(n, dace.nodes.AccessNode) and n.data == "tmp")
+    first = state.add_tasklet("first", {"x"}, {"y"}, "y = x + 1")
+    state.add_edge(tmp, None, first, "x", dace.Memlet("tmp[0]"))
+    s_node = state.add_access("s")
+    state.add_edge(first, "y", s_node, None, dace.Memlet("s"))
+    second = state.add_tasklet("second", {"x"}, {"y"}, "y = x * 3")
+    state.add_edge(s_node, None, second, "x", dace.Memlet("s"))
+    state.add_edge(second, "y", state.add_write("B"), None, dace.Memlet("B[0]"))
+
+    sdfg.apply_gpu_transformations()
+    sdfg.validate()
+    assert sdfg.arrays["s"].storage == dace.StorageType.GPU_Global
+    kernels = {n.label for n in state.nodes() if isinstance(n, dace.nodes.MapEntry)
+               and n.map.schedule == dace.ScheduleType.GPU_Device}
+    assert {"first_gmap", "second_gmap"} <= kernels
+
+
+if __name__ == "__main__":
     test_toplevel_transient_lifetime()
     test_scalar_to_symbol_in_nested_sdfg()
     test_write_subset()
@@ -155,3 +318,7 @@ if __name__ == '__main__':
     for scalar in [False, True]:
         for transient in [False, True]:
             test_free_tasklet(transient, scalar)
+    test_an_interstate_condition_reading_a_gpu_map_output_reads_a_host_copy()
+    test_free_tasklet_with_an_ordering_edge()
+    test_ordering_edge_between_free_tasklets_does_not_block_the_transformation()
+    test_the_transformation_applies_to_the_given_sdfg_not_to_a_nested_one()

@@ -158,6 +158,35 @@ def test_specialize_symbols_batched():
     np.testing.assert_allclose(B, A * 5.0)
 
 
+def test_loop_without_init_or_update_statement():
+    """A while loop holds None as init and update statement; specialising its bound must not trip over them."""
+    from dace.sdfg.state import LoopRegion
+
+    # k = 0; while k < limit: out[0] += 1; k += 1
+    sdfg = dace.SDFG("while_bounded_by_scalar")
+    sdfg.add_scalar("limit", dace.int64)
+    sdfg.add_array("out", [1], dace.int64)
+    sdfg.add_symbol("k", dace.int64)
+    entry = sdfg.add_state("entry", is_start_block=True)
+    loop = LoopRegion("count", condition_expr="k < limit")
+    sdfg.add_node(loop)
+    sdfg.add_edge(entry, loop, dace.InterstateEdge(assignments={"k": "0"}))
+    body = loop.add_state("body", is_start_block=True)
+    tasklet = body.add_tasklet("inc", {"_in"}, {"_out"}, "_out = _in + 1")
+    body.add_edge(body.add_read("out"), None, tasklet, "_in", dace.Memlet("out[0]"))
+    body.add_edge(tasklet, "_out", body.add_write("out"), None, dace.Memlet("out[0]"))
+    step = loop.add_state("step")
+    loop.add_edge(body, step, dace.InterstateEdge(assignments={"k": "k + 1"}))
+
+    assert loop.init_statement is None and loop.update_statement is None
+    specialize_scalars(sdfg, {"limit": 3})
+    assert loop.init_statement is None and loop.update_statement is None
+    assert "limit" not in loop.loop_condition.as_string, loop.loop_condition.as_string
+    out = np.zeros([1], dtype=np.int64)
+    sdfg(out=out, limit=np.int64(7))  # the specialised bound wins over the argument
+    assert out[0] == 3
+
+
 if __name__ == "__main__":
     test_nested_sdfg()
     test_integer_value_keeps_floating_point_division()
@@ -167,3 +196,4 @@ if __name__ == "__main__":
     test_interacting_values_keep_sequential_meaning()
     test_specialize_symbols_bakes_and_removes()
     test_specialize_symbols_batched()
+    test_loop_without_init_or_update_statement()

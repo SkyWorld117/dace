@@ -1,4 +1,6 @@
 # Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
+import numpy
+
 import dace
 from dace.codegen.control_flow import LoopRegion
 from dace.properties import CodeBlock
@@ -149,9 +151,37 @@ def test_interstate_read():
     assert len(s1.nodes()) == 0
 
 
+def _get_sdfg_copying_scalar(memlet_names_scalar: bool):
+    """``nlev`` is copied into the transient ``tmp``, which a tasklet writes to ``A``."""
+    sdfg = dace.SDFG(f"copy_scalar_{int(memlet_names_scalar)}")
+    sdfg.add_scalar("nlev", dtype=dace.int32, transient=False)
+    sdfg.add_scalar("tmp", dtype=dace.int32, transient=True)
+    sdfg.add_array("A", [1], dtype=dace.int32, transient=False)
+    state = sdfg.add_state("s0")
+    nlev, tmp = state.add_access("nlev"), state.add_access("tmp")
+    copy = dace.memlet.Memlet("nlev[0]", other_subset="0") if memlet_names_scalar else dace.memlet.Memlet("tmp[0]")
+    state.add_edge(nlev, None, tmp, None, copy)
+    tasklet = state.add_tasklet("store", {"_in"}, {"_out"}, "_out = _in")
+    state.add_edge(tmp, None, tasklet, "_in", dace.memlet.Memlet("tmp[0]"))
+    state.add_edge(tasklet, "_out", state.add_access("A"), None, dace.memlet.Memlet("A[0]"))
+    return sdfg
+
+
+def test_copy_of_scalar_receives_the_constant():
+    for memlet_names_scalar in (True, False):
+        sdfg = _get_sdfg_copying_scalar(memlet_names_scalar)
+        sdutil.specialize_scalar(sdfg=sdfg, scalar_name="nlev", scalar_val=90)
+        sdfg.validate()
+        assert not any(isinstance(n, dace.nodes.AccessNode) and n.data == "nlev" for n, _ in sdfg.all_nodes_recursive())
+        A = numpy.zeros(1, dtype=numpy.int32)
+        sdfg(A=A, nlev=numpy.int32(0))
+        assert A[0] == 90
+
+
 if __name__ == "__main__":
     test_specialize_with_dynamic_input()
     test_use_in_if_block()
     test_interstate_assignment()
     test_interstate_read()
     test_use_in_for_cfg()
+    test_copy_of_scalar_receives_the_constant()

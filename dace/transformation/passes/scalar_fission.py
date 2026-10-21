@@ -8,6 +8,13 @@ from dace.transformation import pass_pipeline as ppl, transformation
 from dace.transformation.passes import analysis as ap
 
 
+def _rename_tree(state, edge, aliases: Set[str], newname: str) -> None:
+    """Rename the container on every memlet of the memlet tree ``edge`` belongs to."""
+    for e in state.memlet_tree(edge):
+        if e.data.data in aliases:
+            e.data.data = newname
+
+
 @transformation.explicit_cf_compatible
 class ScalarFission(ppl.Pass):
     """
@@ -63,27 +70,21 @@ class ScalarFission(ppl.Pass):
                     aliases = {name} | set(results[name])
                     newname = sdfg.add_datadesc(name, newdesc, find_new_name=True)
 
-                    # Replace the write and any connected memlets with writes to the new data container.
+                    # Replace the write and any connected memlets with writes to the new data container: the
+                    # whole memlet tree of each edge, so a read or write through a map's scope renames the edges
+                    # inside the scope too.
                     write_node = write[1]
                     write_node.data = newname
-                    for iedge in write[0].in_edges(write_node):
-                        if iedge.data.data in aliases:
-                            iedge.data.data = newname
-                    for oeade in write[0].out_edges(write_node):
-                        if oeade.data.data in aliases:
-                            oeade.data.data = newname
+                    for edge in list(write[0].in_edges(write_node)) + list(write[0].out_edges(write_node)):
+                        _rename_tree(write[0], edge, aliases, newname)
 
                     # Replace all dominated reads and connected memlets.
                     for read in shadowed_reads:
                         if isinstance(read[1], nd.AccessNode):
                             read_node = read[1]
                             read_node.data = newname
-                            for iedge in read[0].in_edges(read_node):
-                                if iedge.data.data in aliases:
-                                    iedge.data.data = newname
-                            for oeade in read[0].out_edges(read_node):
-                                if oeade.data.data in aliases:
-                                    oeade.data.data = newname
+                            for edge in list(read[0].in_edges(read_node)) + list(read[0].out_edges(read_node)):
+                                _rename_tree(read[0], edge, aliases, newname)
                         elif isinstance(read[1], InterstateEdge):
                             read[1].replace_dict({name: newname})
 

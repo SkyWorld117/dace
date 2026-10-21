@@ -2,6 +2,7 @@
 
 from typing import Tuple
 import dace
+import numpy as np
 from dace import subsets as dace_sbs
 from dace.sdfg import nodes as dace_nodes
 from dace.sdfg.utils import consolidate_edges
@@ -321,7 +322,43 @@ def test_multi_use_value_output(
     )
 
 
-if __name__ == '__main__':
+
+def test_consolidate_keeps_writes_into_distinct_access_nodes():
+    """A map writes two fields of ``a`` into two access nodes, and a later map reads the second one: consolidating
+    the exit's edges by data name dropped the write into that node, so the later map lost its order after the first
+    (MFC's copy-in of the conserved variables then ran after the conversion that reads them)."""
+    sdfg = dace.SDFG("consolidate_distinct_nodes")
+    sdfg.add_array("x", [2, 10], dace.float64)
+    sdfg.add_array("a", [2, 10], dace.float64)
+    sdfg.add_array("b", [10], dace.float64)
+    state = sdfg.add_state()
+    x = state.add_read("x")
+    entry, exit_ = state.add_map("copy", {"i": "0:10"})
+    a_first = state.add_access("a")
+    a_second = state.add_access("a")
+    for k, a_node in enumerate((a_first, a_second)):
+        t = state.add_tasklet(f"copy_{k}", {"inp"}, {"out"}, "out = inp")
+        state.add_memlet_path(x, entry, t, dst_conn="inp", memlet=dace.Memlet(f"x[{k}, i]"))
+        state.add_memlet_path(t, exit_, a_node, src_conn="out", memlet=dace.Memlet(f"a[{k}, i]"))
+    entry2, exit2 = state.add_map("use", {"i": "0:10"})
+    t = state.add_tasklet("use", {"u", "v"}, {"w"}, "w = u + v")
+    state.add_memlet_path(a_second, entry2, t, dst_conn="u", memlet=dace.Memlet("a[0, i]"))
+    state.add_memlet_path(a_second, entry2, t, dst_conn="v", memlet=dace.Memlet("a[1, i]"))
+    state.add_memlet_path(t, exit2, state.add_write("b"), src_conn="w", memlet=dace.Memlet("b[i]"))
+    sdfg.validate()
+
+    consolidate_edges(sdfg)
+    sdfg.validate()
+    assert state.in_degree(a_second) == 1, "the write into the node the second map reads was dropped"
+    assert state.in_degree(a_first) == 1
+
+    x_val = np.random.rand(2, 10)
+    a_val = np.zeros((2, 10))
+    b_val = np.zeros(10)
+    sdfg(x=x_val, a=a_val, b=b_val)
+    assert np.allclose(b_val, x_val[0] + x_val[1])
+
+if __name__ == "__main__":
     test_consolidate_edges()
     for use_non_standard_memlet in [True, False]:
         for use_inner_access_node in [True, False]:

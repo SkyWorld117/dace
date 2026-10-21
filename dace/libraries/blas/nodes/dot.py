@@ -236,9 +236,10 @@ class Dot(dace.sdfg.nodes.LibraryNode):
         if out_memlet.subset.num_elements() != 1:
             raise ValueError("Output of dot product must be a single element")
 
-        # We are guaranteed that there is only one non-squeezed dimension
-        stride_x = desc_x.strides[sqdims1[0]]
-        stride_y = desc_y.strides[sqdims2[0]]
+        # We are guaranteed that there is at most one non-squeezed dimension; none is left of a single element, whose
+        # stride does not matter.
+        stride_x = desc_x.strides[sqdims1[0]] if sqdims1 else 1
+        stride_y = desc_y.strides[sqdims2[0]] if sqdims2 else 1
         n = squeezed1.num_elements()
         if squeezed1.num_elements() != squeezed2.num_elements():
             raise ValueError('Size mismatch in inputs')

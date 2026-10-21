@@ -1,5 +1,6 @@
 # Copyright 2019-2024 ETH Zurich and the DaCe authors. All rights reserved.
 
+import copy
 from typing import Optional
 from dace import properties
 from dace.frontend.python import astutils
@@ -31,32 +32,28 @@ class PruneEmptyConditionalBranches(ppl.ControlFlowRegionPass):
         if not isinstance(region, ConditionalBlock):
             return None
         removed_branches = 0
-        all_branches = region.branches
-        has_else = all_branches[-1][0] is None
-        new_else_cond = None
-        for cond, branch in all_branches:
+        # A conditional block takes the first branch whose condition holds, so every branch after an eliminated one
+        # was only taken when the eliminated condition did not hold. ``guard`` is the conjunction of the negated
+        # conditions of the branches eliminated so far, which every remaining branch after them must test: an else
+        # branch becomes a conditional branch on it, any other branch tests it before its own condition.
+        guard = None
+        kept = []
+        for cond, branch in region.branches:
             branch_nodes = branch.nodes()
             if (len(branch_nodes) == 0 or (len(branch_nodes) == 1 and isinstance(branch_nodes[0], SDFGState)
                                            and len(branch_nodes[0].nodes()) == 0)):
                 # Found a branch we can eliminate.
-                if has_else and branch is not all_branches[-1][1]:
-                    # If this conditional has an else branch and that is not the branch being eliminated, we need to
-                    # change that else branch to a conditional else-if branch that negates the current branch's
-                    # condition.
+                if cond is not None:
                     negated_condition = astutils.negate_expr(cond.code[0])
-                    if new_else_cond is None:
-                        new_else_cond = properties.CodeBlock([negated_condition])
-                    else:
-                        combined_cond = astutils.and_expr(negated_condition, new_else_cond.code[0])
-                        new_else_cond = properties.CodeBlock([combined_cond])
-                    region.remove_branch(branch)
-                else:
-                    # Simple case, eliminate the branch.
-                    region.remove_branch(branch)
+                    guard = negated_condition if guard is None else astutils.and_expr(guard, negated_condition)
                 removed_branches += 1
-        # If the else branch remains, make sure it now has the new negate-all condition.
-        if region.branches and new_else_cond is not None and region.branches[-1][0] is None:
-            region._branches[-1] = (new_else_cond, region._branches[-1][1])
+                continue
+            if guard is not None:
+                guarded = copy.deepcopy(guard) if cond is None else astutils.and_expr(guard, cond.code[0])
+                cond = properties.CodeBlock([guarded])
+            kept.append([cond, branch])
+        if removed_branches > 0:
+            region._branches = kept
 
         if len(region.branches) == 0:
             # The conditional has become entirely empty, remove it.

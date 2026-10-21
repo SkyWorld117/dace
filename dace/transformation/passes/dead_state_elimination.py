@@ -170,8 +170,14 @@ class DeadStateElimination(ppl.Pass):
         return set(cfg.nodes()) - visited, dead_edges, edges_annotated
 
     def _find_dead_branches(self, block: ConditionalBlock) -> List[Tuple[CodeBlock, ControlFlowRegion]]:
+        """
+        Returns the branches of ``block`` that are never taken.
+
+        A conditional block takes the first branch whose condition holds. A branch is therefore never taken if its
+        condition is definitely false, or if the condition of an earlier branch is definitely true. A branch before
+        the first definitely true condition stays: it is taken whenever its own condition holds.
+        """
         dead_branches = []
-        unconditional = None
         for i, (cond, branch) in enumerate(block.branches):
             if cond is None:
                 if not i == len(block.branches) - 1:
@@ -182,21 +188,13 @@ class DeadStateElimination(ppl.Pass):
                         node_id=None,
                     )
                 break
-            # If an unconditional branch is found, ignore all other branches that follow this one.
-            if self._is_definitely_true(symbolic.pystr_to_symbolic(cond.as_string), block.sdfg):
-                unconditional = branch
+            condition = symbolic.pystr_to_symbolic(cond.as_string)
+            if self._is_definitely_true(condition, block.sdfg):
+                # Every branch that follows this one is never taken.
+                dead_branches.extend([c, b] for c, b in block.branches[i + 1 :])
                 break
-        if unconditional is not None:
-            # Remove other (now never taken) branches
-            for cond, branch in block.branches:
-                if branch is not unconditional:
-                    dead_branches.append([cond, branch])
-        else:
-            # Check if any branches are certainly never taken.
-            for cond, branch in block.branches:
-                if cond is not None and self._is_definitely_false(symbolic.pystr_to_symbolic(cond.as_string),
-                                                                  block.sdfg):
-                    dead_branches.append([cond, branch])
+            if self._is_definitely_false(condition, block.sdfg):
+                dead_branches.append([cond, branch])
 
         return dead_branches
 

@@ -79,7 +79,9 @@ class ExpandPure(ExpandTransformation):
         else:
             sdfg.add_scalar(out_name, out.dtype, storage=out.storage)
 
-        # COUNT returns int regardless of mask kind; cast before reducing.
+        # COUNT returns int regardless of mask kind, and it counts NONZERO elements: a Fortran LOGICAL's .TRUE.
+        # is any nonzero bit pattern (-1, HUGE), so the raw value must be normalised to 0/1 before the sum --
+        # casting alone would add the bit pattern itself and overflow (0 + 1 + 4294967295 + ...).
         cast_state = sdfg.add_state(f"{node.label}_cast", is_start_block=True)
         params = [f"__i{i}" for i in range(len(mask_shape))]
         rng = {p: f"0:{s}" for p, s in zip(params, mask_shape)}
@@ -88,7 +90,7 @@ class ExpandPure(ExpandTransformation):
             f"{node.label}_cast_tasklet",
             rng,
             inputs={"_in_v": dace.memlet.Memlet(f"{mask_name}[{idx}]")},
-            code="_out_v = _in_v",
+            code="_out_v = 1 if _in_v != 0 else 0",
             outputs={"_out_v": dace.memlet.Memlet(f"_mask_int[{idx}]")},
             external_edges=True,
         )

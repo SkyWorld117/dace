@@ -721,8 +721,20 @@ def remove_scalar_reads(sdfg: sd.SDFG, array_names: Dict[str, str]):
                     if (isinstance(e.src, nodes.EntryNode) and len(state.edges_between(e.src, dst)) == 0):
                         state.add_nedge(e.src, dst, mm.Memlet())
 
+        # A node left with empty memlets only ordered its reads: it passes that order on, from its predecessors to
+        # its successors, and goes like an isolated one (its descriptor is removed with the scalar).
+        for node in scalar_nodes:
+            if node not in state or not all(e.data.is_empty() for e in state.all_edges(node)):
+                continue
+            for in_edge in state.in_edges(node):
+                for out_edge in state.out_edges(node):
+                    if not state.edges_between(in_edge.src, out_edge.dst):
+                        state.add_nedge(in_edge.src, out_edge.dst, mm.Memlet())
+            for edge in state.all_edges(node):
+                state.remove_edge(edge)
+
         # Remove newly-isolated nodes
-        state.remove_nodes_from([n for n in scalar_nodes if len(state.all_edges(n)) == 0])
+        state.remove_nodes_from([n for n in scalar_nodes if n in state and len(state.all_edges(n)) == 0])
 
 
 def translate_cpp_tasklet_to_python(code: str):
@@ -792,6 +804,14 @@ class ScalarToSymbolPromotion(passes.Pass):
                 if node not in state or state.in_degree(node) == 0:
                     continue
                 in_edge = state.in_edges(node)[0]
+                if in_edge.data.is_empty():
+                    # An empty memlet only orders the scalar's reads after its source; it writes nothing. The
+                    # readers keep that order themselves, and the node is a plain read of the symbol.
+                    for out_edge in state.out_edges(node):
+                        if not state.edges_between(in_edge.src, out_edge.dst):
+                            state.add_nedge(in_edge.src, out_edge.dst, mm.Memlet())
+                    state.remove_edge(in_edge)
+                    continue
                 input = in_edge.src
 
                 # There is only zero or one incoming edges by definition

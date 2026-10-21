@@ -768,7 +768,10 @@ def consolidate_edges_scope(state: SDFGState, scope_node: Union[nd.EntryNode, nd
     """
     if scope_node is None:
         return 0
-    data_to_conn = {}
+    # Keyed by the outer access node, not its data: two access nodes of one array are two points in the state's
+    # order (a map writing both, one of them read downstream); merging their edges into one of them would drop the
+    # write into the other and with it the order of whatever reads that other node.
+    node_to_conn = {}
     consolidated = 0
     if isinstance(scope_node, nd.EntryNode):
         outer_edges = state.in_edges
@@ -778,10 +781,10 @@ def consolidate_edges_scope(state: SDFGState, scope_node: Union[nd.EntryNode, nd
         remove_inner_connector = scope_node.remove_out_connector
         prefix, oprefix = 'IN_', 'OUT_'
 
-        def get_outer_data(e: MultiConnectorEdge[dace.Memlet]):
+        def get_outer_node(e: MultiConnectorEdge[dace.Memlet]):
             mpath = state.memlet_path(e)
             assert isinstance(mpath[0].src, nd.AccessNode)
-            return mpath[0].src.data
+            return mpath[0].src
 
         def get_outer_subset(e: MultiConnectorEdge[dace.Memlet]):
             return e.data.get_src_subset(e, state)
@@ -797,10 +800,10 @@ def consolidate_edges_scope(state: SDFGState, scope_node: Union[nd.EntryNode, nd
         remove_inner_connector = scope_node.remove_in_connector
         prefix, oprefix = 'OUT_', 'IN_'
 
-        def get_outer_data(e: MultiConnectorEdge[dace.Memlet]):
+        def get_outer_node(e: MultiConnectorEdge[dace.Memlet]):
             mpath = state.memlet_path(e)
             assert isinstance(mpath[-1].dst, nd.AccessNode)
-            return mpath[-1].dst.data
+            return mpath[-1].dst
 
         def get_outer_subset(e: MultiConnectorEdge[dace.Memlet]):
             return e.data.get_dst_subset(e, state)
@@ -815,18 +818,18 @@ def consolidate_edges_scope(state: SDFGState, scope_node: Union[nd.EntryNode, nd
             continue
         conn = inner_conn(e)
         edges_by_connector[conn].append(e)
-        odata = get_outer_data(e)
-        if odata not in data_to_conn:
-            data_to_conn[odata] = conn
-        elif data_to_conn[odata] != conn:  # Need to consolidate
+        onode = get_outer_node(e)
+        if onode not in node_to_conn:
+            node_to_conn[onode] = conn
+        elif node_to_conn[onode] != conn:  # Need to consolidate
             connectors_to_remove.add(conn)
 
     for conn in connectors_to_remove:
         e = edges_by_connector[conn][0]
-        odata = get_outer_data(e)
+        onode = get_outer_node(e)
         offset = 3 if conn.startswith('IN_') else (4 if conn.startswith('OUT_') else len(oprefix))
         # Outer side of the scope - remove edge and union subsets
-        target_conn = prefix + data_to_conn[odata][offset:]
+        target_conn = prefix + node_to_conn[onode][offset:]
         conn_to_remove = prefix + conn[offset:]
         remove_outer_connector(conn_to_remove)
         if isinstance(scope_node, nd.EntryNode):
@@ -849,11 +852,11 @@ def consolidate_edges_scope(state: SDFGState, scope_node: Union[nd.EntryNode, nd
         if isinstance(scope_node, nd.EntryNode):
             remove_inner_connector(e.src_conn)
             for e in edges_by_connector[conn]:
-                e._src_conn = data_to_conn[odata]
+                e._src_conn = node_to_conn[onode]
         else:
             remove_inner_connector(e.dst_conn)
             for e in edges_by_connector[conn]:
-                e._dst_conn = data_to_conn[odata]
+                e._dst_conn = node_to_conn[onode]
 
     return consolidated
 
@@ -2573,6 +2576,7 @@ def _specialize_scalar_impl(root: 'dace.SDFG', sdfg: 'dace.SDFG', scalars: Dict[
     # 3. Access Node
     # -> If access node is used then e.g. [scalar] -> [tasklet]
     # -> then create a [tasklet] that uses the scalar_val as a constant value inside
+    # -> If it is copied into another container, [scalar] -> [access node], a tasklet writes the constant there
     import numpy
     import re
     import ast
@@ -2608,7 +2612,10 @@ def _specialize_scalar_impl(root: 'dace.SDFG', sdfg: 'dace.SDFG', scalars: Dict[
             return repr(float(value))
         return str(value)
 
-    def repl_code_block_or_str(input: Union[CodeBlock, str], repl: Dict[str, str]):
+    def repl_code_block_or_str(input: Optional[Union[CodeBlock, str]], repl: Dict[str, str]):
+        # A loop without an init or update statement (a while loop) holds None there: nothing to rewrite.
+        if input is None:
+            return None
         if isinstance(input, CodeBlock):
             return CodeBlock(_token_replace_all(input.as_string, repl))
         for src, dst in repl.items():
@@ -2645,12 +2652,21 @@ def _specialize_scalar_impl(root: 'dace.SDFG', sdfg: 'dace.SDFG', scalars: Dict[
         for e in state.edges():
             if e not in state.edges():
                 continue
-            if e.data is None or e.data.data not in scalars:
+            if e.data is None:
+                continue
+            # A copy out of the scalar may name either container in its memlet.
+            copied = (
+                isinstance(e.src, nd.AccessNode)
+                and e.src.data in scalars
+                and isinstance(e.dst, nd.AccessNode)
+                and e.dst.data not in scalars
+            )
+            if e.data.data not in scalars and not copied:
                 continue
 
-            # Now we know we have an edge where memlet.data is one of the scalars. Each edge carries
+            # Now we know we have an edge reading or writing one of the scalars. Each edge carries
             # exactly one data name, so the scalars partition the edges -- no edge is claimed twice.
-            scalar_name = e.data.data
+            scalar_name = e.src.data if copied else e.data.data
             scalar_val = scalars[scalar_name]
             scalar_dtype = scalar_dtypes[scalar_name]
 
@@ -2679,6 +2695,14 @@ def _specialize_scalar_impl(root: 'dace.SDFG', sdfg: 'dace.SDFG', scalars: Dict[
                     src.remove_out_connector(e.src_conn)
                 if e.dst_conn is not None:
                     dst.remove_in_connector(e.dst_conn)
+            elif copied:
+                # The container the scalar was copied into receives the constant instead; dropping the
+                # copy alone would leave it unwritten.
+                literal = _scalar_literal(scalar_val, scalar_dtype)
+                tasklet = state.add_tasklet(f"specialized_{scalar_name}", {}, {"_out"}, f"_out = {literal}")
+                subset = e.data.get_dst_subset(e, state)
+                state.add_edge(tasklet, "_out", dst, e.dst_conn, dace.memlet.Memlet(data=dst.data, subset=subset))
+                state.remove_edge(e)
             else:
                 state.remove_edge(e)
                 if e.src_conn is not None:
