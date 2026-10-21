@@ -25,7 +25,9 @@ def test_in_scope_write_is_not_const():
     state.add_memlet_path(use, mx, out, src_conn="y", memlet=dace.Memlet("out[i]"))
     sdfg.validate()
     cu = next(c for c in sdfg.generate_code() if c.language == "cu").clean_code
-    head = re.search(r"__global__ void\s+(?:__launch_bounds__\([^)]*\)\s+)?k_\w*\(([^)]*)\)", cu)
+    # Our codegen qualifies a kernel symbol with the top-level program name
+    # (``gpu_in_scope_write_k_0_0_7``), so match any kernel name, not just ``k_*``.
+    head = re.search(r"__global__ void\s+(?:__launch_bounds__\([^)]*\)\s+)?\w+\(([^)]*)\)", cu)
     assert head is not None
     params = [p.strip() for p in head.group(1).split(",")]
     assert not any(p.startswith("const") and p.endswith(" a") for p in params), params
