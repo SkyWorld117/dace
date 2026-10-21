@@ -47,6 +47,18 @@ namespace dace
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
         static __constant__ unsigned long long dace_glibc_expf_tab[32] = {
             0x3ff0000000000000ULL, 0x3fefd9b0d3158574ULL, 0x3fefb5586cf9890fULL,
             0x3fef9301d0125b51ULL, 0x3fef72b83c7d517bULL, 0x3fef54873168b9aaULL,
@@ -60,14 +72,14 @@ namespace dace
             0x3fef3720dcef9069ULL, 0x3fef5818dcfba487ULL, 0x3fef7c97337b9b5fULL,
             0x3fefa4afa2a490daULL, 0x3fefd0765b6e4540ULL
         };
-static __device__ const unsigned dace_tanf_two_over_pi[24] = {
-    0x000000a2u, 0x0000a2f9u, 0x00a2f983u, 0xa2f9836eu,
-    0xf9836e4eu, 0x836e4e44u, 0x6e4e4415u, 0x4e441529u,
-    0x441529fcu, 0x1529fc27u, 0x29fc2757u, 0xfc2757d1u,
-    0x2757d1f5u, 0x57d1f534u, 0xd1f534ddu, 0xf534ddc0u,
-    0x34ddc0dbu, 0xddc0db62u, 0xc0db6295u, 0xdb629599u,
-    0x6295993cu, 0x95993c43u, 0x993c4390u, 0x3c439041u,
-};
+        static __device__ const unsigned dace_tanf_two_over_pi[24] = {
+            0x000000a2u, 0x0000a2f9u, 0x00a2f983u, 0xa2f9836eu,
+            0xf9836e4eu, 0x836e4e44u, 0x6e4e4415u, 0x4e441529u,
+            0x441529fcu, 0x1529fc27u, 0x29fc2757u, 0xfc2757d1u,
+            0x2757d1f5u, 0x57d1f534u, 0xd1f534ddu, 0xf534ddc0u,
+            0x34ddc0dbu, 0xddc0db62u, 0xc0db6295u, 0xdb629599u,
+            0x6295993cu, 0x95993c43u, 0x993c4390u, 0x3c439041u,
+        };
 
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
 
@@ -629,245 +641,565 @@ static __device__ const unsigned dace_tanf_two_over_pi[24] = {
             return dace_glibc_logf(a);
         }
 
-/*
- * Bit-exact device lowering of glibc 2.34 x86-64 FLOAT `tanf`.
- *
- * Host ground truth: /lib64/libm.so.6, tanf@@GLIBC_2.2.5 at vaddr 0x3cd40
- * (weak, NOT an IFUNC -- unlike sincosf, the resolved entry on this CPU is
- * this scalar SSE body), with the shared __kernel_tanf at 0x3aff0.
- *
- * Every host arithmetic step is a separate mulss/addss/subss/divss or
- * mulsd/addsd/subsd/divsd: glibc's tanf contains NO fused multiply-add.
- * The device code therefore uses __f*_rn / __d*_rn intrinsics, which map to
- * non-contractible PTX (mul.rn.f32, add.rn.f32, ...).  Plain operators are
- * NOT safe here: nvcc's default -fmad=true would fuse a*b+c and change the
- * last bit.
- *
- * VERIFIED on host: exhaustive over all 2^32 bit patterns through a volatile
- * function pointer to glibc tanf -> n_differ = 0, max_ulp = 0.
- */
-/* 2/pi in 32-bit words (libm.so.6 .rodata @0xa7a60).  Declared in both the
-   host and device passes (but only for CUDA/HIP compilers) so that nvcc can
-   register the device symbol; plain g++ builds never see it. */
-#if defined(__CUDACC__) || defined(__HIPCC__)
+        /*
+         * Bit-exact device lowering of glibc 2.34 x86-64 FLOAT `tanf`.
+         *
+         * Host ground truth: /lib64/libm.so.6, tanf@@GLIBC_2.2.5 at vaddr 0x3cd40
+         * (weak, NOT an IFUNC -- unlike sincosf, the resolved entry on this CPU is
+         * this scalar SSE body), with the shared __kernel_tanf at 0x3aff0.
+         *
+         * Every host arithmetic step is a separate mulss/addss/subss/divss or
+         * mulsd/addsd/subsd/divsd: glibc's tanf contains NO fused multiply-add.
+         * The device code therefore uses __f*_rn / __d*_rn intrinsics, which map to
+         * non-contractible PTX (mul.rn.f32, add.rn.f32, ...).  Plain operators are
+         * NOT safe here: nvcc's default -fmad=true would fuse a*b+c and change the
+         * last bit.
+         *
+         * VERIFIED on host: exhaustive over all 2^32 bit patterns through a volatile
+         * function pointer to glibc tanf -> n_differ = 0, max_ulp = 0.
+         */
+        /* 2/pi in 32-bit words (libm.so.6 .rodata @0xa7a60).  Declared in both the
+           host and device passes (but only for CUDA/HIP compilers) so that nvcc can
+           register the device symbol; plain g++ builds never see it. */
+        #if defined(__CUDACC__) || defined(__HIPCC__)
 
-#endif
+        #endif
 
 
-DACE_DFI unsigned dace_tanf_bits(float f)
-{
-    return __float_as_uint(f);
-}
-
-DACE_DFI float dace_tanf_from_bits(unsigned u)
-{
-    return __uint_as_float(u);
-}
-
-/* libm.so.6 0x3aff0: __kernel_tanf(x, y, iy), fdlibm k_tanf.c */
-DACE_DFI float dace_glibc_tanf_kernel(float x, float y, int iy)
-{
-    unsigned ecx = dace_tanf_bits(x) & 0x7fffffffu;
-    float xmm6 = x;
-    unsigned edx = dace_tanf_bits(x);
-    int eax = iy;
-
-    if ((int)ecx <= 0x38ffffff) {              /* |x| < 2^-14 */
-        int esi = (int)x;                      /* cvttss2si */
-        if (esi != 0)
-            goto poly;
-        if (((unsigned)(iy + 1) | ecx) == 0) { /* iy == -1 && x == +-0 */
-            float ax = dace_tanf_from_bits(dace_tanf_bits(xmm6) & 0x7fffffffu);
-            return __fdiv_rn(1.0f, ax);
-        }
-        if (iy == 1) {
-            float ax = dace_tanf_from_bits(dace_tanf_bits(xmm6) & 0x7fffffffu);
-            if (dace_tanf_from_bits(0x00800000u) > ax) { /* raise underflow, value = x */
-                volatile float sink = __fmul_rn(ax, xmm6);
-                (void)sink;
-            }
-            return xmm6;
-        }
-        return __fdiv_rn(-1.0f, xmm6);
-    }
-
-    if ((int)ecx <= 0x3f2ca13f)
-        goto poly;
-
-    /* 0x3b040: |x| >= 0.674408, rebase around pi/4 */
-    {
-        if (edx & 0x80000000u) {
-            xmm6 = -xmm6;
-            y = -y;
-        }
+        DACE_DFI unsigned dace_tanf_bits(float f)
         {
-            float pio4   = dace_tanf_from_bits(0x3f490fdau);
-            float pio4lo = dace_tanf_from_bits(0x33222168u);
-            float a = __fsub_rn(pio4, xmm6);
-            float b = __fsub_rn(pio4lo, y);
-            xmm6 = __fadd_rn(b, a);            /* (pio4lo-y) + (pio4-x) */
+            return __float_as_uint(f);
         }
+
+        DACE_DFI float dace_tanf_from_bits(unsigned u)
         {
-            float c = dace_tanf_from_bits(0x39000000u);   /* 2^-13 */
-            float s = dace_tanf_from_bits(dace_tanf_bits(xmm6) & 0x7fffffffu);
-            if (c > s) {                       /* 0x3b238, very near pi/4 */
-                int neg2 = ((edx >> 30) & 2u);
-                int f0   = 1 - neg2;
-                int p    = f0 * eax;
-                int two  = eax + eax;
-                float v2 = (float)two;
-                float v0 = (float)p;
-                float t  = __fmul_rn(v2, xmm6);
-                float om = __fsub_rn(1.0f, t);
-                return __fmul_rn(v0, om);
-            }
-            y = 0.0f;
+            return __uint_as_float(u);
         }
-    }
 
-poly:
-    {
-        const float T0  = dace_tanf_from_bits(0x3eaaaaabu);
-        const float T1  = dace_tanf_from_bits(0x3e088889u);
-        const float T2  = dace_tanf_from_bits(0x3d5d0dd1u);
-        const float T3  = dace_tanf_from_bits(0x3cb327a4u);
-        const float T4  = dace_tanf_from_bits(0x3c11371fu);
-        const float T5  = dace_tanf_from_bits(0x3b6b6916u);
-        const float T6  = dace_tanf_from_bits(0x3abede48u);
-        const float T7  = dace_tanf_from_bits(0x3a1a26c8u);
-        const float T8  = dace_tanf_from_bits(0x398137b9u);
-        const float T9  = dace_tanf_from_bits(0x38a3f445u);
-        const float T10 = dace_tanf_from_bits(0x3895c07au);
-        const float T11 = dace_tanf_from_bits(0xb79bae5fu);
-        const float T12 = dace_tanf_from_bits(0x37d95384u);
-
-        float z = __fmul_rn(xmm6, xmm6);       /* xmm3 */
-        float s = __fmul_rn(xmm6, z);          /* xmm2 = x^3 */
-        float w = __fmul_rn(z, z);             /* xmm5 = x^4 */
-        float a, b;
-
-        a = __fadd_rn(__fmul_rn(T12, w), T10);
-        b = __fadd_rn(__fmul_rn(T11, w), T9);
-        a = __fadd_rn(__fmul_rn(a, w), T8);
-        b = __fadd_rn(__fmul_rn(b, w), T7);
-        a = __fadd_rn(__fmul_rn(a, w), T6);
-        b = __fadd_rn(__fmul_rn(b, w), T5);
-        a = __fadd_rn(__fmul_rn(a, w), T4);
-        b = __fadd_rn(__fmul_rn(b, w), T3);
-        a = __fadd_rn(__fmul_rn(a, w), T2);
-        b = __fadd_rn(__fmul_rn(b, w), T1);
-        a = __fmul_rn(a, z);                   /* v chain * z */
-        a = __fadd_rn(a, b);                   /* r + v */
+        /* libm.so.6 0x3aff0: __kernel_tanf(x, y, iy), fdlibm k_tanf.c */
+        DACE_DFI float dace_glibc_tanf_kernel(float x, float y, int iy)
         {
-            float q  = __fmul_rn(a, s);        /* s*(r+v) */
-            float t0 = __fmul_rn(s, T0);       /* T0*s */
-            float ww;
-            q = __fadd_rn(q, y);
-            q = __fmul_rn(q, z);
-            {
-                float yy = __fadd_rn(y, q);    /* y + z*(s*(r+v)+y) */
-                float rr = __fadd_rn(t0, yy);  /* final r */
-                ww = __fadd_rn(xmm6, rr);      /* w = x + r */
-                if ((int)ecx > 0x3f2ca13f) {   /* 0x3b1c0 */
-                    float v   = (float)eax;
-                    float sq  = __fmul_rn(ww, ww);
-                    float den = __fadd_rn(ww, v);
-                    float dv  = __fdiv_rn(sq, den);
-                    float t2;
-                    int neg2  = ((edx >> 30) & 2u);
-                    int f0    = 1 - neg2;
-                    dv = __fsub_rn(dv, rr);
-                    t2 = __fsub_rn(xmm6, dv);
-                    t2 = __fadd_rn(t2, t2);
-                    v  = __fsub_rn(v, t2);
-                    return __fmul_rn((float)f0, v);
+            unsigned ecx = dace_tanf_bits(x) & 0x7fffffffu;
+            float xmm6 = x;
+            unsigned edx = dace_tanf_bits(x);
+            int eax = iy;
+
+            if ((int)ecx <= 0x38ffffff) {              /* |x| < 2^-14 */
+                int esi = (int)x;                      /* cvttss2si */
+                if (esi != 0)
+                    goto poly;
+                if (((unsigned)(iy + 1) | ecx) == 0) { /* iy == -1 && x == +-0 */
+                    float ax = dace_tanf_from_bits(dace_tanf_bits(xmm6) & 0x7fffffffu);
+                    return __fdiv_rn(1.0f, ax);
                 }
-                if (eax == 1)
-                    return ww;
-                /* 0x3b16e: iy == -1, reciprocal refinement */
+                if (iy == 1) {
+                    float ax = dace_tanf_from_bits(dace_tanf_bits(xmm6) & 0x7fffffffu);
+                    if (dace_tanf_from_bits(0x00800000u) > ax) { /* raise underflow, value = x */
+                        volatile float sink = __fmul_rn(ax, xmm6);
+                        (void)sink;
+                    }
+                    return xmm6;
+                }
+                return __fdiv_rn(-1.0f, xmm6);
+            }
+
+            if ((int)ecx <= 0x3f2ca13f)
+                goto poly;
+
+            /* 0x3b040: |x| >= 0.674408, rebase around pi/4 */
+            {
+                if (edx & 0x80000000u) {
+                    xmm6 = -xmm6;
+                    y = -y;
+                }
                 {
-                    float q0  = __fdiv_rn(-1.0f, ww);
-                    float whi = dace_tanf_from_bits(dace_tanf_bits(ww) & 0xfffff000u);
-                    float qhi = dace_tanf_from_bits(dace_tanf_bits(q0) & 0xfffff000u);
-                    float d   = __fsub_rn(whi, xmm6);
-                    float t1  = __fsub_rn(rr, d);
-                    float t3;
-                    t1 = __fmul_rn(t1, qhi);
-                    t3 = __fmul_rn(whi, qhi);
-                    t3 = __fadd_rn(t3, 1.0f);
-                    t1 = __fadd_rn(t1, t3);
-                    t1 = __fmul_rn(t1, q0);
-                    return __fadd_rn(qhi, t1);
+                    float pio4   = dace_tanf_from_bits(0x3f490fdau);
+                    float pio4lo = dace_tanf_from_bits(0x33222168u);
+                    float a = __fsub_rn(pio4, xmm6);
+                    float b = __fsub_rn(pio4lo, y);
+                    xmm6 = __fadd_rn(b, a);            /* (pio4lo-y) + (pio4-x) */
+                }
+                {
+                    float c = dace_tanf_from_bits(0x39000000u);   /* 2^-13 */
+                    float s = dace_tanf_from_bits(dace_tanf_bits(xmm6) & 0x7fffffffu);
+                    if (c > s) {                       /* 0x3b238, very near pi/4 */
+                        int neg2 = ((edx >> 30) & 2u);
+                        int f0   = 1 - neg2;
+                        int p    = f0 * eax;
+                        int two  = eax + eax;
+                        float v2 = (float)two;
+                        float v0 = (float)p;
+                        float t  = __fmul_rn(v2, xmm6);
+                        float om = __fsub_rn(1.0f, t);
+                        return __fmul_rn(v0, om);
+                    }
+                    y = 0.0f;
+                }
+            }
+
+        poly:
+            {
+                const float T0  = dace_tanf_from_bits(0x3eaaaaabu);
+                const float T1  = dace_tanf_from_bits(0x3e088889u);
+                const float T2  = dace_tanf_from_bits(0x3d5d0dd1u);
+                const float T3  = dace_tanf_from_bits(0x3cb327a4u);
+                const float T4  = dace_tanf_from_bits(0x3c11371fu);
+                const float T5  = dace_tanf_from_bits(0x3b6b6916u);
+                const float T6  = dace_tanf_from_bits(0x3abede48u);
+                const float T7  = dace_tanf_from_bits(0x3a1a26c8u);
+                const float T8  = dace_tanf_from_bits(0x398137b9u);
+                const float T9  = dace_tanf_from_bits(0x38a3f445u);
+                const float T10 = dace_tanf_from_bits(0x3895c07au);
+                const float T11 = dace_tanf_from_bits(0xb79bae5fu);
+                const float T12 = dace_tanf_from_bits(0x37d95384u);
+
+                float z = __fmul_rn(xmm6, xmm6);       /* xmm3 */
+                float s = __fmul_rn(xmm6, z);          /* xmm2 = x^3 */
+                float w = __fmul_rn(z, z);             /* xmm5 = x^4 */
+                float a, b;
+
+                a = __fadd_rn(__fmul_rn(T12, w), T10);
+                b = __fadd_rn(__fmul_rn(T11, w), T9);
+                a = __fadd_rn(__fmul_rn(a, w), T8);
+                b = __fadd_rn(__fmul_rn(b, w), T7);
+                a = __fadd_rn(__fmul_rn(a, w), T6);
+                b = __fadd_rn(__fmul_rn(b, w), T5);
+                a = __fadd_rn(__fmul_rn(a, w), T4);
+                b = __fadd_rn(__fmul_rn(b, w), T3);
+                a = __fadd_rn(__fmul_rn(a, w), T2);
+                b = __fadd_rn(__fmul_rn(b, w), T1);
+                a = __fmul_rn(a, z);                   /* v chain * z */
+                a = __fadd_rn(a, b);                   /* r + v */
+                {
+                    float q  = __fmul_rn(a, s);        /* s*(r+v) */
+                    float t0 = __fmul_rn(s, T0);       /* T0*s */
+                    float ww;
+                    q = __fadd_rn(q, y);
+                    q = __fmul_rn(q, z);
+                    {
+                        float yy = __fadd_rn(y, q);    /* y + z*(s*(r+v)+y) */
+                        float rr = __fadd_rn(t0, yy);  /* final r */
+                        ww = __fadd_rn(xmm6, rr);      /* w = x + r */
+                        if ((int)ecx > 0x3f2ca13f) {   /* 0x3b1c0 */
+                            float v   = (float)eax;
+                            float sq  = __fmul_rn(ww, ww);
+                            float den = __fadd_rn(ww, v);
+                            float dv  = __fdiv_rn(sq, den);
+                            float t2;
+                            int neg2  = ((edx >> 30) & 2u);
+                            int f0    = 1 - neg2;
+                            dv = __fsub_rn(dv, rr);
+                            t2 = __fsub_rn(xmm6, dv);
+                            t2 = __fadd_rn(t2, t2);
+                            v  = __fsub_rn(v, t2);
+                            return __fmul_rn((float)f0, v);
+                        }
+                        if (eax == 1)
+                            return ww;
+                        /* 0x3b16e: iy == -1, reciprocal refinement */
+                        {
+                            float q0  = __fdiv_rn(-1.0f, ww);
+                            float whi = dace_tanf_from_bits(dace_tanf_bits(ww) & 0xfffff000u);
+                            float qhi = dace_tanf_from_bits(dace_tanf_bits(q0) & 0xfffff000u);
+                            float d   = __fsub_rn(whi, xmm6);
+                            float t1  = __fsub_rn(rr, d);
+                            float t3;
+                            t1 = __fmul_rn(t1, qhi);
+                            t3 = __fmul_rn(whi, qhi);
+                            t3 = __fadd_rn(t3, 1.0f);
+                            t1 = __fadd_rn(t1, t3);
+                            t1 = __fmul_rn(t1, q0);
+                            return __fadd_rn(qhi, t1);
+                        }
+                    }
                 }
             }
         }
-    }
-}
 
-DACE_DFI float dace_glibc_tanf(float a)
-{
-    unsigned u  = dace_tanf_bits(a);
-    unsigned ix = u & 0x7fffffffu;
+        DACE_DFI float dace_glibc_tanf(float a)
+        {
+            unsigned u  = dace_tanf_bits(a);
+            unsigned ix = u & 0x7fffffffu;
 
-    if (ix <= 0x3f490fdau)                     /* |x| <= pi/4 */
-        return dace_glibc_tanf_kernel(a, 0.0f, 1);
+            if (ix <= 0x3f490fdau)                     /* |x| <= pi/4 */
+                return dace_glibc_tanf_kernel(a, 0.0f, 1);
 
-    if (ix <= 0x7f7fffffu) {                   /* finite */
-        double dx = (double)a;
-        unsigned top = (u >> 20) & 0x7ffu;
-        if (top <= 0x42eu) {                   /* 0x3cd91: |x| < 120 */
-            const double c1 = 0x1.45f306dc9c883p+23; /* 2/pi * 2^24 */
-            const double c2 = 0x1.921fb54442d18p+0;  /* pi/2 */
-            int t = (int)__dmul_rn(dx, c1);
-            int n = (t + 0x800000) >> 24;
-            double r = __dsub_rn(dx, __dmul_rn((double)n, c2));
-            float hi = (float)r;
-            float lo = (float)__dsub_rn(r, (double)hi);
-            int iy = 1 - (((unsigned)n << 1) & 2u);
-            return dace_glibc_tanf_kernel(hi, lo, iy);
-        } else {                               /* 0x3ce18: |x| >= 120 */
-            unsigned idx = (u >> 26) & 0xfu;
-            unsigned m   = (u & 0x7fffffu) | 0x800000u;
-            unsigned sh  = (u >> 23) & 7u;
-            unsigned m2  = m << sh;
-            unsigned long long p0  = (unsigned long long)m2 * (unsigned long long)dace_tanf_two_over_pi[idx];
-            unsigned long long p2  = (unsigned long long)m2 * (unsigned long long)dace_tanf_two_over_pi[idx + 8];
-            unsigned long long rax = ((unsigned long long)(unsigned)p0 << 32) | (p2 >> 32);
-            unsigned long long rcx = (unsigned long long)m2 * (unsigned long long)dace_tanf_two_over_pi[idx + 4];
-            unsigned long long rsi;
-            unsigned quad;
-            double r;
-            rcx += rax;
-            rsi = 0x2000000000000000ull + rcx;
-            rcx -= rsi & 0xc000000000000000ull;
-            quad = (unsigned)(rsi >> 62);
-            r = __dmul_rn((double)(long long)rcx, 0x1.921fb54442d18p-62);
-            if (u & 0x80000000u)
-                r = -r;
-            {
-                float hi = (float)r;
-                float lo = (float)__dsub_rn(r, (double)hi);
-                int iy = 1 - (((unsigned)quad << 1) & 2u);
-                return dace_glibc_tanf_kernel(hi, lo, iy);
+            if (ix <= 0x7f7fffffu) {                   /* finite */
+                double dx = (double)a;
+                unsigned top = (u >> 20) & 0x7ffu;
+                if (top <= 0x42eu) {                   /* 0x3cd91: |x| < 120 */
+                    const double c1 = 0x1.45f306dc9c883p+23; /* 2/pi * 2^24 */
+                    const double c2 = 0x1.921fb54442d18p+0;  /* pi/2 */
+                    int t = (int)__dmul_rn(dx, c1);
+                    int n = (t + 0x800000) >> 24;
+                    double r = __dsub_rn(dx, __dmul_rn((double)n, c2));
+                    float hi = (float)r;
+                    float lo = (float)__dsub_rn(r, (double)hi);
+                    int iy = 1 - (((unsigned)n << 1) & 2u);
+                    return dace_glibc_tanf_kernel(hi, lo, iy);
+                } else {                               /* 0x3ce18: |x| >= 120 */
+                    unsigned idx = (u >> 26) & 0xfu;
+                    unsigned m   = (u & 0x7fffffu) | 0x800000u;
+                    unsigned sh  = (u >> 23) & 7u;
+                    unsigned m2  = m << sh;
+                    unsigned long long p0  = (unsigned long long)m2 * (unsigned long long)dace_tanf_two_over_pi[idx];
+                    unsigned long long p2  = (unsigned long long)m2 * (unsigned long long)dace_tanf_two_over_pi[idx + 8];
+                    unsigned long long rax = ((unsigned long long)(unsigned)p0 << 32) | (p2 >> 32);
+                    unsigned long long rcx = (unsigned long long)m2 * (unsigned long long)dace_tanf_two_over_pi[idx + 4];
+                    unsigned long long rsi;
+                    unsigned quad;
+                    double r;
+                    rcx += rax;
+                    rsi = 0x2000000000000000ull + rcx;
+                    rcx -= rsi & 0xc000000000000000ull;
+                    quad = (unsigned)(rsi >> 62);
+                    r = __dmul_rn((double)(long long)rcx, 0x1.921fb54442d18p-62);
+                    if (u & 0x80000000u)
+                        r = -r;
+                    {
+                        float hi = (float)r;
+                        float lo = (float)__dsub_rn(r, (double)hi);
+                        int iy = 1 - (((unsigned)quad << 1) & 2u);
+                        return dace_glibc_tanf_kernel(hi, lo, iy);
+                    }
+                }
             }
+
+            /* inf / nan: glibc evaluates x - x.  Encode x86 SSE's exact result
+               instead of relying on the GPU's default-NaN convention:
+                 +-inf -> 0xffc00000 (QNaN floating-point indefinite)
+                 nan   -> input with the quiet bit set, sign/payload preserved. */
+            if (ix == 0x7f800000u)
+                return dace_tanf_from_bits(0xffc00000u);
+            return dace_tanf_from_bits(u | 0x00400000u);
         }
-    }
 
-    /* inf / nan: glibc evaluates x - x.  Encode x86 SSE's exact result
-       instead of relying on the GPU's default-NaN convention:
-         +-inf -> 0xffc00000 (QNaN floating-point indefinite)
-         nan   -> input with the quiet bit set, sign/payload preserved. */
-    if (ix == 0x7f800000u)
-        return dace_tanf_from_bits(0xffc00000u);
-    return dace_tanf_from_bits(u | 0x00400000u);
-}
+        /* Non-template float overload wins overload resolution over
+           template<class T> T tan(const T&), as for dace_glibc_sinf. */
+        DACE_DFI float tan(const float& a)
+        {
+            return dace_glibc_tanf(a);
+        }
 
-/* Non-template float overload wins overload resolution over
-   template<class T> T tan(const T&), as for dace_glibc_sinf. */
-DACE_DFI float tan(const float& a)
-{
-    return dace_glibc_tanf(a);
-}
+/* ------------------------------------------------------------------
+   Bit-exact device lowering of glibc 2.34's x86-64 FMA `powf`.
+   (FUNCTION TO TRANSCRIBE: powf -- float, arity 2.)
+
+   MEASURED GROUND TRUTH (2026-10-22).  On this host the default symbol
+   `powf@@GLIBC_2.27` is an IFUNC; `nm -D` shows `i powf@@GLIBC_2.27`, and its
+   resolver (libm.so.6 0x3a540) selects the FMA/VEX implementation at offset
+   0x6ddb0 on this AMD EPYC 9555 (cpuid FMA + AVX2).  `/tmp/resolve_pow3`
+   confirms `dlsym(RTLD_DEFAULT,"powf") - dladdr().dli_fbase == 0x6ddb0`.
+   The SSE2 twin at 0x3a170 is the same algorithm, so this transcription is
+   the FMA variant instruction-for-instruction.
+
+   The routine therefore reproduces glibc's ERROR, not the correctly-rounded
+   result: log2 via a 16-entry table + a degree-5 polynomial evaluated in
+   DOUBLE with FMA, then exp2 via a 32-entry table + a degree-3 polynomial in
+   DOUBLE, rounding to float exactly once at the end (cvtsd2ss).  The special
+   -case lattice (0/inf/nan, negative bases and integer exponents, overflow at
+   0x1.fffffffd1d571p+6, underflow at -150, may-underflow at -149) is kept
+   verbatim.
+
+   Tables are the exact .rodata bit patterns of libm.so.6: the log2 table at
+   0xa7920 (16 x {invc,logc}) and the exp2 table at 0xa7580, which stores
+   `asuint64(2^(i/32)) - (i << 47)` so that `ski << 47` can be added as an
+   integer.  Constants: OFF=0x3f330000, SHIFT=0x1.8p47, SIGN_BIAS=1<<16.
+
+   Verified against the real libm powf through a volatile function pointer:
+   see the accompanying sweep (n_samples / n_differ / max_ulp reported with
+   the transcription).  No libm calls, no long double, no std::.
+   ------------------------------------------------------------------ */
+        DACE_DFI unsigned dace_powf_u32(float f)
+        {
+#ifdef __CUDA_ARCH__
+            return __float_as_uint(f);
+#else
+            unsigned u;
+            __builtin_memcpy(&u, &f, 4);
+            return u;
+#endif
+        }
+
+        DACE_DFI float dace_powf_f32(unsigned u)
+        {
+#ifdef __CUDA_ARCH__
+            return __uint_as_float(u);
+#else
+            float f;
+            __builtin_memcpy(&f, &u, 4);
+            return f;
+#endif
+        }
+
+        DACE_DFI unsigned long long dace_powf_u64(double x)
+        {
+#ifdef __CUDA_ARCH__
+            return (unsigned long long)__double_as_longlong(x);
+#else
+            unsigned long long u;
+            __builtin_memcpy(&u, &x, 8);
+            return u;
+#endif
+        }
+
+        DACE_DFI double dace_powf_f64(unsigned long long u)
+        {
+#ifdef __CUDA_ARCH__
+            return __longlong_as_double((long long)u);
+#else
+            double x;
+            __builtin_memcpy(&x, &u, 8);
+            return x;
+#endif
+        }
+
+        /* x86 SSE returns the FIRST NaN operand, quieted, preserving sign and
+           payload; measured on the reference for both add and multiply. */
+        DACE_DFI int dace_powf_isnan(unsigned u)
+        {
+            return (u & 0x7fffffffu) > 0x7f800000u;
+        }
+
+        DACE_DFI float dace_powf_add(float a, float b)
+        {
+            unsigned ua = dace_powf_u32(a), ub = dace_powf_u32(b);
+            if (dace_powf_isnan(ua)) return dace_powf_f32(ua | 0x00400000u);
+            if (dace_powf_isnan(ub)) return dace_powf_f32(ub | 0x00400000u);
+            return a + b;
+        }
+
+        DACE_DFI float dace_powf_sq(float x)
+        {
+            unsigned ux = dace_powf_u32(x);
+            if (dace_powf_isnan(ux)) return dace_powf_f32(ux | 0x00400000u);
+            return x * x;
+        }
+
+        /* Unary minus is an exact sign-bit flip (measured, including NaNs). */
+        DACE_DFI float dace_powf_neg(float x)
+        {
+            return dace_powf_f32(dace_powf_u32(x) ^ 0x80000000u);
+        }
+
+        /* x86 divss: a NaN divisor is returned quieted, sign/payload intact. */
+        DACE_DFI float dace_powf_rcp(float x)
+        {
+            unsigned ux = dace_powf_u32(x);
+            if (dace_powf_isnan(ux)) return dace_powf_f32(ux | 0x00400000u);
+            return 1.0f / x;
+        }
+
+        DACE_DFI int dace_powf_checkint(unsigned iy)
+        {
+            int e = (iy >> 23) & 0xff;
+            if (e < 0x7f) return 0;
+            if (e > 0x7f + 23) return 2;
+            if (iy & ((1u << (0x7f + 23 - e)) - 1u)) return 0;
+            if (iy & (1u << (0x7f + 23 - e))) return 1;
+            return 2;
+        }
+
+        DACE_DFI int dace_powf_zeroinfnan(unsigned ix)
+        {
+            return 2u * ix - 1u >= 2u * 0x7f800000u - 1u;
+        }
+
+        DACE_DFI int dace_powf_issignaling(unsigned ix)
+        {
+            return ((ix ^ 0x400000u) & 0x7fffffffu) > 0x7fc00000u;
+        }
+
+        DACE_DFI double dace_powf_log2(unsigned ix)
+        {
+            static const unsigned long long T[16][2] = {
+                {0x3ff661ec79f8f3beULL, 0xbfdefec65b963019ULL},
+                {0x3ff571ed4aaf883dULL, 0xbfdb0b6832d4fca4ULL},
+                {0x3ff49539f0f010b0ULL, 0xbfd7418b0a1fb77bULL},
+                {0x3ff3c995b0b80385ULL, 0xbfd39de91a6dcf7bULL},
+                {0x3ff30d190c8864a5ULL, 0xbfd01d9bf3f2b631ULL},
+                {0x3ff25e227b0b8ea0ULL, 0xbfc97c1d1b3b7af0ULL},
+                {0x3ff1bb4a4a1a343fULL, 0xbfc2f9e393af3c9fULL},
+                {0x3ff12358f08ae5baULL, 0xbfb960cbbf788d5cULL},
+                {0x3ff0953f419900a7ULL, 0xbfaa6f9db6475fceULL},
+                {0x3ff0000000000000ULL, 0x0000000000000000ULL},
+                {0x3fee608cfd9a47acULL, 0x3fb338ca9f24f53dULL},
+                {0x3feca4b31f026aa0ULL, 0x3fc476a9543891baULL},
+                {0x3feb2036576afce6ULL, 0x3fce840b4ac4e4d2ULL},
+                {0x3fe9c2d163a1aa2dULL, 0x3fd40645f0c6651cULL},
+                {0x3fe886e6037841edULL, 0x3fd88e9c2c1b9ff8ULL},
+                {0x3fe767dcf5534862ULL, 0x3fdce0a44eb17bccULL},
+            };
+            static const unsigned long long A[5] = {
+                0x3fd27616c9496e0bULL,  /*  0.28845758110921399 */
+                0xbfd71969a075c67aULL,  /* -0.36092606229713164 */
+                0x3fdec70a6ca7baddULL,  /*  0.48089848147257702 */
+                0xbfe7154748bef6c8ULL,  /* -0.72134746750062906 */
+                0x3ff71547652ab82bULL,  /*  1.4426950408774342  */
+            };
+
+            unsigned tmp = ix - 0x3f330000u;              /* OFF */
+            int i = (int)((tmp >> (23 - 4)) % 16u);
+            unsigned top = tmp & 0xff800000u;
+            unsigned iz = ix - top;
+            int k = (int)((int)top >> 23);                /* arithmetic shift */
+
+            double invc = dace_powf_f64(T[i][0]);
+            double logc = dace_powf_f64(T[i][1]);
+            double z = (double)dace_powf_f32(iz);
+
+            double r  = fma(z, invc, -1.0);
+            double y0 = logc + (double)k;
+
+            double r2 = r * r;
+            double y  = fma(dace_powf_f64(A[0]), r, dace_powf_f64(A[1]));
+            double p  = fma(dace_powf_f64(A[2]), r, dace_powf_f64(A[3]));
+            double r4 = r2 * r2;
+            double q  = fma(dace_powf_f64(A[4]), r, y0);
+            q = fma(p, r2, q);
+            y = fma(y, r4, q);
+            return y;
+        }
+
+        DACE_DFI double dace_powf_exp2(double xd, unsigned sign_bias)
+        {
+            static const unsigned long long T[32] = {
+                0x3ff0000000000000ULL, 0x3fefd9b0d3158574ULL,
+                0x3fefb5586cf9890fULL, 0x3fef9301d0125b51ULL,
+                0x3fef72b83c7d517bULL, 0x3fef54873168b9aaULL,
+                0x3fef387a6e756238ULL, 0x3fef1e9df51fdee1ULL,
+                0x3fef06fe0a31b715ULL, 0x3feef1a7373aa9cbULL,
+                0x3feedea64c123422ULL, 0x3feece086061892dULL,
+                0x3feebfdad5362a27ULL, 0x3feeb42b569d4f82ULL,
+                0x3feeab07dd485429ULL, 0x3feea47eb03a5585ULL,
+                0x3feea09e667f3bcdULL, 0x3fee9f75e8ec5f74ULL,
+                0x3feea11473eb0187ULL, 0x3feea589994cce13ULL,
+                0x3feeace5422aa0dbULL, 0x3feeb737b0cdc5e5ULL,
+                0x3feec49182a3f090ULL, 0x3feed503b23e255dULL,
+                0x3feee89f995ad3adULL, 0x3feeff76f2fb5e47ULL,
+                0x3fef199bdd85529cULL, 0x3fef3720dcef9069ULL,
+                0x3fef5818dcfba487ULL, 0x3fef7c97337b9b5fULL,
+                0x3fefa4afa2a490daULL, 0x3fefd0765b6e4540ULL,
+            };
+            static const unsigned long long C[3] = {
+                0x3fac6af84b912394ULL,  /* 0.055503615593415351 */
+                0x3fcebfce50fac4f3ULL,  /* 0.2402284522445722   */
+                0x3fe62e42ff0c52d6ULL,  /* 0.69314718069162029  */
+            };
+
+            double kd = xd + 0x1.8p47;                    /* SHIFT */
+            unsigned long long ki = dace_powf_u64(kd);
+            kd -= 0x1.8p47;
+            double r = xd - kd;
+
+            unsigned long long t = T[ki % 32u];
+            unsigned long long ski = ki + (unsigned long long)sign_bias;
+            t += ski << (52 - 5);
+            double s = dace_powf_f64(t);
+
+            double z = fma(dace_powf_f64(C[0]), r, dace_powf_f64(C[1]));
+            double r2 = r * r;
+            double y = fma(dace_powf_f64(C[2]), r, 1.0);
+            y = fma(z, r2, y);
+            y = y * s;
+            return y;
+        }
+
+        DACE_DFI float pow(const float& a, const float& b)
+        {
+            const unsigned SIGN_BIAS = 1u << 16;          /* 0x10000 */
+            float x = a;
+            float y = b;
+            unsigned sign_bias = 0;
+            unsigned ix = dace_powf_u32(x);
+            unsigned iy = dace_powf_u32(y);
+
+            if (ix - 0x00800000u >= 0x7f800000u - 0x00800000u ||
+                dace_powf_zeroinfnan(iy))
+            {
+                if (dace_powf_zeroinfnan(iy))
+                {
+                    if (2u * iy == 0)
+                        return dace_powf_issignaling(ix) ? dace_powf_add(x, y) : 1.0f;
+                    if (ix == 0x3f800000u)
+                        return dace_powf_issignaling(iy) ? dace_powf_add(x, y) : 1.0f;
+                    if (2u * ix > 2u * 0x7f800000u || 2u * iy > 2u * 0x7f800000u)
+                        return dace_powf_add(x, y);
+                    if (2u * ix == 2u * 0x3f800000u)
+                        return 1.0f;
+                    if ((2u * ix < 2u * 0x3f800000u) == !(iy & 0x80000000u))
+                        return 0.0f;
+                    return y * y;
+                }
+                if (dace_powf_zeroinfnan(ix))
+                {
+                    float x2 = dace_powf_sq(x);
+                    unsigned div_sign = 0;
+                    if ((ix & 0x80000000u) && dace_powf_checkint(iy) == 1)
+                    {
+                        x2 = dace_powf_neg(x2);
+                        div_sign = 1;
+                    }
+                    if (2u * ix == 0 && (iy & 0x80000000u))
+                        return dace_powf_f32((div_sign ? 0x80000000u : 0u) |
+                                             0x7f800000u);   /* __math_divzerof */
+                    return (iy & 0x80000000u) ? dace_powf_rcp(x2) : x2;
+                }
+                /* x and y are non-zero finite. */
+                if (ix & 0x80000000u)
+                {
+                    int yint = dace_powf_checkint(iy);
+                    if (yint == 0)
+                        return dace_powf_f32(0xffc00000u);  /* (x-x)/(x-x) */
+                    if (yint == 1)
+                        sign_bias = SIGN_BIAS;
+                    ix &= 0x7fffffffu;
+                }
+                if (ix < 0x00800000u)
+                {
+                    /* Normalize subnormal x so the exponent becomes negative. */
+                    ix = dace_powf_u32(x * 0x1p23f);
+                    ix &= 0x7fffffffu;
+                    ix -= 23u << 23;
+                }
+            }
+
+            double logx = dace_powf_log2(ix);
+            double ylogx = (double)y * logx;
+
+            if (((dace_powf_u64(ylogx) >> 47) & 0xffffu) >= 0x80bfu)
+            {
+                if (ylogx > 0x1.fffffffd1d571p+6)
+                    return dace_powf_f32(sign_bias ? 0xff800000u : 0x7f800000u);
+                if (ylogx > 0x1.fffffffa3aae2p+6)
+                {
+                    /* glibc's round-away-from-zero check; both constants round
+                       to 1.0f / -1.0f, so this is never taken in practice. */
+                    float up = 1.0f + 0x1p-25f;
+                    float dn = -1.0f - 0x1p-25f;
+                    if ((!sign_bias && up != 1.0f) ||
+                        ( sign_bias && dn != -1.0f))
+                        return dace_powf_f32(sign_bias ? 0xff800000u : 0x7f800000u);
+                }
+                if (ylogx <= -150.0)
+                    return dace_powf_f32(sign_bias ? 0x80000000u : 0x00000000u);
+                if (ylogx < -149.0)
+                    return dace_powf_f32(sign_bias ? 0x80000001u : 0x00000001u);
+            }
+            return (float)dace_powf_exp2(ylogx, sign_bias);
+        }
+
+        /* `base ** integer` call shapes lower onto the same glibc-exact
+           routine (the host reference evaluates powf(base, (float)n)). */
+        DACE_DFI float pow(const float& a, const int& b)
+        {
+            return pow(a, (float)b);
+        }
+
+        DACE_DFI float pow(const float& a, const unsigned int& b)
+        {
+            return pow(a, (float)b);
+        }
 
 /* ------------------------------------------------------------------
  * Bit-exact device lowering of glibc 2.34's float `log10f`.
