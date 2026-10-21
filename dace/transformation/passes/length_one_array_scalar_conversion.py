@@ -267,6 +267,9 @@ def descriptor_is_written(sdfg: SDFG, name: str) -> bool:
 #: Consumers (the dace-fortran bridge) key their own bookkeeping on these labels.
 _STAGING_STATE_PREFIXES = ('stage_copyin', 'stage_copyout')
 
+#: Public spelling: the dace-fortran bridge and the merged pipelines import this name.
+STAGING_STATE_PREFIXES = _STAGING_STATE_PREFIXES
+
 
 def _already_staged(sdfg: SDFG, name: str) -> bool:
     """True if every reference to ``name`` sits in a staging state a previous run created.
