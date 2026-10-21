@@ -32,6 +32,15 @@ DACE_EXPORTED void *load_library(const char *filename) {
     return hLibrary;
 }
 
+// Read this immediately after a failed load, before any further loader operation.
+DACE_EXPORTED const char *get_load_error() {
+#ifdef _WIN32
+    return nullptr;
+#else
+    return dlerror();
+#endif
+}
+
 // Returns 1 if the library is already loaded, 0 if not, or -1 on error
 DACE_EXPORTED int is_library_loaded(const char *filename) {
     if (!filename)
