@@ -1018,6 +1018,17 @@ class CPPUnparser:
         # Fortran GAMMA / LOG_GAMMA -- ``dace::math::tgamma`` / ``lgamma``
         # (float overloads, so real(4) stays single precision).
         'tgamma': 'dace::math::tgamma', 'lgamma': 'dace::math::lgamma',
+        # Fortran integer powers and remainders that the dace-fortran bridge emits as BARE names in
+        # a condition string or a tasklet body (``bridge/ast/expressions.cpp``).  They reach the
+        # generated code through codeblock_to_cpp's Python-AST path, not the sympy printer, so a
+        # name not remapped here is emitted verbatim and fails to compile ("'FtnMod' was not
+        # declared").  ``FtnMod`` is the TRUNCATED remainder (C ``%`` / ``fmod``), ``FtnModulo``
+        # the floored one (Fortran MODULO); the runtime names keep the two apart.  The two mod
+        # helpers live in the GLOBAL namespace in this fork's ``math.h`` (the ``dace::math`` block
+        # starts below them), unlike ``ipow`` -- hence the bare spelling.
+        'ipow': 'dace::math::ipow',
+        'FtnMod': 'cpp_mod',
+        'FtnModulo': 'floor_mod',
     }
 
     def _Call(self, t: ast.Call):

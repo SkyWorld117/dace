@@ -18,6 +18,8 @@
 #include "vector.h"
 #include "intset.h"
 #include "math.h"
+// Mixed-kind Fortran MOD / MODULO operands; forwards to math.h's single-type forms.
+#include "fortran_mod.h"
 #include "complex.h"
 #include "pyinterop.h"
 #include "reduction.h"

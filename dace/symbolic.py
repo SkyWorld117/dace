@@ -2051,6 +2051,12 @@ class _SerializedSymbolicParser(ast.NodeVisitor):
         'int_ceil': int_ceil,
         'IfExpr': IfExpr,
         'Mod': sympy.Mod,
+        # Fortran MOD / MODULO as the dace-fortran bridge spells them.  ``FtnMod`` is the truncated
+        # remainder (C ``%``, what sympy.Mod prints) and ``FtnModulo`` the floored one.  Without these
+        # entries the parser makes an OPAQUE function, which a memlet subset cannot resolve -> ``?``
+        # (a record-array index ``co(mod(i, 4)) % a`` in a module-level table).
+        'FtnMod': sympy.Mod,
+        'FtnModulo': fortran_mod,
         'fortran_mod': fortran_mod,
         'Attr': Attr,
         'BitwiseAnd': bitwise_and,
@@ -2442,6 +2448,8 @@ _PYSTR2SYM_locals = {
     'int_ceil': int_ceil,
     'IfExpr': IfExpr,
     'Mod': sympy.Mod,
+    'FtnMod': sympy.Mod,
+    'FtnModulo': fortran_mod,
     'fortran_mod': fortran_mod,
     'int32': int32,
     'int64': int64,
