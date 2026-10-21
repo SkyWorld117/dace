@@ -1122,6 +1122,32 @@ class int_ceil(sympy.Function):
         return True
 
 
+class ipow(sympy.Function):
+    """Integer power ``base ** exp`` with a non-negative integer exponent, lowered to
+    ``dace::math::ipow`` (repeated multiply, exact integer) -- valid where ``dace::math::pow``
+    (libm ``double``) is not: an array size, subscript or loop bound.  ``RelaxIntegerPowers``
+    mints these from ``Pow``."""
+
+    @classmethod
+    def eval(cls, base, exp):
+        # A negative constant is a reciprocal, which is a ``Pow``, not an ``ipow``; an exponent of
+        # unknown sign is the caller's to prove.
+        if exp.is_Number and exp.is_negative:
+            raise ValueError(f'ipow exponent must be non-negative, got {exp}')
+        if base.is_Number and exp.is_Number:
+            return base**exp
+
+    def _eval_is_integer(self):
+        base, exp = self.args
+        if base.is_integer and exp.is_integer:
+            return True
+
+    def _eval_is_positive(self):
+        base, _exp = self.args
+        if base.is_positive:
+            return True
+
+
 class OR(sympy.Function):
 
     @classmethod
@@ -2011,6 +2037,7 @@ class _SerializedSymbolicParser(ast.NodeVisitor):
         'ceiling': sympy.ceiling,
         'sqrt': sympy.sqrt,
         'round': ROUND,
+    'ipow': ipow,
         'And': AND,
         'Or': OR,
         'Not': sympy.Not,
@@ -2380,6 +2407,7 @@ _PYSTR2SYM_locals = {
     'floor': sympy.floor,
     'ceil': sympy.ceiling,
     'round': ROUND,
+    'ipow': ipow,
     # Resolve infinity/NaN names so they survive inside expressions (e.g. ``a + inf``).
     'inf': sympy.oo,
     'nan': sympy.nan,
@@ -2575,6 +2603,8 @@ class DaceSympyPrinter(sympy.printing.str.StrPrinter):
             return f'{expr.func}[{indices}]'
         if self.cpp_mode and str(expr.func) == 'int_floor':
             return '((%s) / (%s))' % (self._print(expr.args[0]), self._print(expr.args[1]))
+        if self.cpp_mode and str(expr.func) == 'ipow':
+            return 'dace::math::ipow(%s, %s)' % (self._print(expr.args[0]), self._print(expr.args[1]))
         # Self-contained floored-modulus form (pure ``%`` operators, no qualified call:
         # those don't resolve in the memlet-subset codegen context).
         if self.cpp_mode and str(expr.func) == 'fortran_mod':
