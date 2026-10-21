@@ -20,6 +20,8 @@
 #include "math.h"
 // Mixed-kind Fortran MOD / MODULO operands; forwards to math.h's single-type forms.
 #include "fortran_mod.h"
+// Opt-in (DACE_GLIBC_F32): bit-exact device lowering of glibc's float transcendentals.
+#include "glibc_f32.h"
 #include "complex.h"
 #include "pyinterop.h"
 #include "reduction.h"
