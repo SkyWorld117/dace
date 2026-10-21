@@ -4,6 +4,8 @@ import ast
 from dataclasses import dataclass
 from functools import lru_cache
 
+import sympy
+
 from dace.frontend.python import astutils
 from dace.sdfg.analysis import cfg as cfg_analysis
 from dace.sdfg.sdfg import InterstateEdge

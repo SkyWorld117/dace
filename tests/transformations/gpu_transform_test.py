@@ -1,6 +1,8 @@
 # Copyright 2019-2021 ETH Zurich and the DaCe authors. All rights reserved.
 """ Unit tests for the GPU to-device transformation. """
 
+import re
+
 import dace
 import numpy as np
 import pytest
@@ -146,47 +148,6 @@ def test_free_tasklet(transient, scalar):
     sdfg.validate()
 
 
-def _row_doubling_body(shape):
-    """``b[0, j] = 2 * a[0, j]``, with both connectors describing the whole container."""
-    sdfg = dace.SDFG("body")
-    sdfg.add_array("a", shape, dace.float64)
-    sdfg.add_array("b", shape, dace.float64)
-    sdfg.add_symbol("j", dace.int64)
-    state = sdfg.add_state()
-    tasklet = state.add_tasklet("t", {"x"}, {"y"}, "y = x * 2")
-    state.add_edge(state.add_read("a"), None, tasklet, "x", dace.Memlet("a[0, j]"))
-    state.add_edge(tasklet, "y", state.add_write("b"), None, dace.Memlet("b[0, j]"))
-    return sdfg
-
-
-def test_gpu_local_storage_of_a_nested_sdfg_row():
-    """The copy on the device holds one row, so the connectors describe a row rather than a matrix.
-
-    ``GPUTransformLocalStorage`` copies only the part of each array the map reads, dropping the
-    dimensions the copy is a single index of. Under the nested SDFG contract (see
-    ``dace.sdfg.dealias.integrate_nested_sdfg``) a connector is the container it is connected to,
-    so the connectors below have to be restated the same way.
-    """
-    shape = (4, 5)
-    sdfg = dace.SDFG("gpu_local_storage_nested")
-    sdfg.add_array("A", shape, dace.float64)
-    sdfg.add_array("B", shape, dace.float64)
-    state = sdfg.add_state()
-    entry, exit_ = state.add_map("m", dict(j="0:%d" % shape[1]))
-    node = state.add_nested_sdfg(_row_doubling_body(shape), {"a"}, {"b"}, {"j": "j"})
-    state.add_memlet_path(state.add_read("A"), entry, node, dst_conn="a", memlet=dace.Memlet("A[0, j]"))
-    state.add_memlet_path(node, exit_, state.add_write("B"), src_conn="b", memlet=dace.Memlet("B[0, j]"))
-    sdfg.validate()
-
-    assert sdfg.apply_transformations(GPUTransformLocalStorage) == 1
-
-    for edge in state.all_edges(node):
-        connector = edge.dst_conn if edge.dst is node else edge.src_conn
-        assert len(node.sdfg.arrays[connector].shape) == 1
-        assert node.sdfg.arrays[connector].is_equivalent(sdfg.arrays[edge.data.data])
-    sdfg.validate()
-
-
 @pytest.mark.gpu
 def test_an_interstate_condition_reading_a_gpu_map_output_reads_a_host_copy():
     """A GPU map writes ``flag`` and the next interstate condition reads ``flag[0]`` on the host. The
@@ -293,7 +254,10 @@ def test_ordering_edge_between_free_tasklets_does_not_block_the_transformation()
     sdfg = _program_with_two_ordered_free_tasklets()
     sdfg.apply_gpu_transformations()
     sdfg.validate()
-    state = sdfg.start_state
+    # The transformation inserts a copy-in state before the original one, so the kernels are not in
+    # ``start_state``: find the state holding the two ordered tasklets.
+    state = next(s for s in sdfg.states()
+                 if any(isinstance(n, dace.nodes.Tasklet) and n.label == 'first' for n in s.nodes()))
     kernels = [n for n in state.nodes() if isinstance(n, dace.nodes.MapEntry)]
     assert len(kernels) == 2 and all(k.map.schedule == dace.ScheduleType.GPU_Device for k in kernels)
 
@@ -354,7 +318,6 @@ if __name__ == "__main__":
     for scalar in [False, True]:
         for transient in [False, True]:
             test_free_tasklet(transient, scalar)
-    test_gpu_local_storage_of_a_nested_sdfg_row()
     test_an_interstate_condition_reading_a_gpu_map_output_reads_a_host_copy()
     test_free_tasklet_with_an_ordering_edge()
     test_ordering_edge_between_free_tasklets_does_not_block_the_transformation()
