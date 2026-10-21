@@ -173,14 +173,17 @@ _ENVIRONMENTS = [
 ]
 
 
-def test_init_selects_device_zero_once():
+def test_init_keeps_the_process_selected_device():
     """The ordinal is not a build-time choice: one build is shared by every rank, so a compiled-in
-    ordinal would send them all to the same GPU. Device 0 always, and which physical GPU that is is
-    the process's business (CUDA_VISIBLE_DEVICES renumbers what it exposes)."""
+    ordinal would send them all to the same GPU.  Init therefore READS the process's current device
+    and selects that one; which physical GPU it is, is the launcher's business (a per-rank
+    ``CUDA_VISIBLE_DEVICES`` or a ``cudaSetDevice`` before the call).  Resetting to 0 would undo a
+    multi-rank launcher's assignment -- the reason the portable change was to inherit, not to select."""
     cu, _ = _sources(_gpu_sdfg('one_device_probe'))
 
-    assert 'const int __dace_device = 0;' in cu
-    assert cu.count('cudaSetDevice(') == 1, 'selecting it anywhere else would make it mutable'
+    assert 'GetDevice(&__dace_device)' in cu, 'init must read the device the process selected'
+    assert 'const int __dace_device = 0;' not in cu, 'a compiled-in ordinal would pin every rank to one GPU'
+    assert cu.count('SetDevice(') == 1, 'selecting it anywhere else would make it mutable'
 
 
 def test_the_device_ordinal_is_not_configurable():
@@ -206,10 +209,10 @@ def test_handle_setup_takes_no_device(module_name, cls_name, accessor):
 
 
 @pytest.mark.gpu
-def test_the_program_runs_on_device_zero_whatever_the_caller_was_on():
-    """``__dace_init_cuda`` SELECTS device 0 rather than inheriting the caller's, so the thread is
-    on it when the program returns. Started from a different device, which is the only way to tell
-    selecting apart from inheriting."""
+def test_the_program_runs_on_the_device_the_caller_selected():
+    """``__dace_init_cuda`` INHERITS the caller's device instead of selecting 0, so a launcher that
+    put rank k on GPU k keeps it.  Started from a different device, which is the only way to tell
+    inheriting apart from selecting."""
     cudart = None
     for name in (find_library('cudart'), 'libcudart.so', 'libcudart.so.13', 'libcudart.so.12'):
         if name:
@@ -232,7 +235,7 @@ def test_the_program_runs_on_device_zero_whatever_the_caller_was_on():
 
     current = ctypes.c_int(-1)
     cudart.cudaGetDevice(ctypes.byref(current))
-    assert current.value == 0
+    assert current.value == 1, 'init reset the caller\'s device instead of inheriting it'
 
 
 if __name__ == '__main__':
