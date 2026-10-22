@@ -646,11 +646,112 @@ namespace dace
             return (int)std::floor(a);
         }
 
+        // ------------------------------------------------------------------
+        // Bit-exact device lowering of glibc's float `sinf`.
+        //
+        // MEASURED (2026-10-21).  The stock build's host transcendentals are glibc, and glibc
+        // 2.34's `sinf` is NOT correctly rounded: over a dense sweep it differs from the
+        // correctly-rounded result ((float)sinq((__float128)x), cross-checked against a long
+        // double reference) on 1.30% of arguments by 1 ulp.  So CUDA's `sinf` -- or any
+        // correctly-rounded CRT implementation -- can NEVER agree with it bit-for-bit.
+        //
+        // What does reproduce it is glibc's own algorithm: sinf evaluates a 7th-order odd
+        // polynomial in DOUBLE and rounds once to float (libm.so.6: cvtss2sd on entry,
+        // cvtsd2ss on exit).  The routine below transcribes the x86-64 FMA variant
+        // (the `sinf` IFUNC selecting __sinf_fma, libm.so.6 0x6e150, with its constant table
+        // at 0x7ac0 in .rodata) instruction-for-instruction, including FMA fusion order.
+        //
+        // VERIFIED on GPU (`sinprobe/gsinfprobe.cu`) against host glibc sinf, 4.2M samples each:
+        //   [0, pi/2]     0 differing   [-2pi, 2pi]  0 differing
+        //   [0, 120)      0 differing   [-120, 120)  0 differing      -> BIT-EXACT
+        //
+        // NOT a complete fix by itself: the host build is also auto-vectorized, so some call
+        // sites bind libmvec's `_ZGVbN4v_sinf` (a float32 SVML routine) instead -- see
+        // `wrf_dace.patch`/notes.  Sites NOT auto-vectorized are reproduced exactly by this.
+        // ------------------------------------------------------------------
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+        DACE_DFI unsigned dace_f32_bits(float f)
+        {
+#ifdef __CUDA_ARCH__
+            return __float_as_uint(f);
+#else
+            unsigned u;
+            __builtin_memcpy(&u, &f, 4);
+            return u;
+#endif
+        }
+
+        DACE_DFI float dace_glibc_sinf(float y)
+        {
+            /* glibc's sincosf table (libm.so.6 .rodata @0x7ac0).  table[1] differs from
+               table[0] only by negating every cosine coefficient; s1/s2/s3 are shared. */
+            const double HPI_INV   = 10680707.430881744;             /* 2/PI * 2^24 */
+            const double HPI       = 1.5707963267948966;             /* PI/2 */
+            const double S1        = -0.16666654943701084;
+            const double S2        =  0.008332178146138854;
+            const double S3        = -0.00019517298981385725;
+
+            double x = (double)y;
+            unsigned b = (dace_f32_bits(y) >> 20) & 0x7ffu;
+            if (b <= 0x3f3u)                        /* fast path: |y| < 0.6875 */
+            {
+                if (b <= 0x397u) return y;          /* |y| < 2^-12 -> y */
+                double z  = x * x;
+                double x3 = x * z;
+                double p  = fma(S3, z, S2);
+                double x5 = z * x3;
+                double q  = fma(x3, S1, x);
+                return (float)fma(p, x5, q);
+            }
+            else if (b <= 0x42eu)                   /* |y| < 120 */
+            {
+                int t = (int)(x * HPI_INV);
+                int n = (t + 0x800000) >> 24;       /* round(x * 2/pi) */
+                bool swap = (n & 2) != 0;           /* select table[1] */
+                double C0 = swap ? -1.0 : 1.0;
+                double C1 = swap ?  0.49999999725108224 : -0.49999999725108224;
+                double C2 = swap ? -0.041666623324344516 : 0.041666623324344516;
+                double C3 = swap ?  0.001388676379437604 : -0.001388676379437604;
+                double C4 = swap ? -2.4390450703564542e-05 : 2.4390450703564542e-05;
+                double dn = (double)n;
+                double r  = fma(-dn, HPI, x);
+                double z  = r * r;
+                if ((n & 1) == 0)
+                {
+                    double rs = r * (((n & 3) == 0 || (n & 3) == 3) ? 1.0 : -1.0);
+                    double a  = fma(S3, z, S2);
+                    double t3 = rs * z;
+                    double t2 = z * t3;
+                    double t1 = fma(t3, S1, rs);
+                    return (float)fma(a, t2, t1);
+                }
+                else
+                {
+                    double x4 = z * z;
+                    double e  = fma(C1, z, C0);
+                    double f_ = fma(C4, z, C3);
+                    double x6 = z * x4;
+                    double g  = fma(x4, C2, e);
+                    return (float)fma(f_, x6, g);
+                }
+            }
+            return sinf(y);  /* |y| >= 120, nan or inf: unchanged (not reached by WRF) */
+        }
+#endif
+
         template<typename T>
         DACE_CONSTEXPR DACE_HDFI T sin(const T& a)
         {
             return std::sin(a);
         }
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+        /* Non-template exact match wins overload resolution for float operands, so every
+           generated device `dace::math::sin(<float32>)` lowers to the glibc-exact routine. */
+        DACE_DFI float sin(const float& a)
+        {
+            return dace_glibc_sinf(a);
+        }
+#endif
         template<typename T>
         DACE_CONSTEXPR DACE_HDFI T asin(const T& a)
         {
