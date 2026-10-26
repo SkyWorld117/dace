@@ -35,6 +35,7 @@
 // ---------------------------------------------------------------------------------------------
 
 #include "math.h"
+#include "glibc_tanhf.h"
 
 #if !defined(DACE_GLIBC_F32)
 // Off: nothing is added and every `dace::math::<fn>` keeps its existing (libdevice) lowering.
@@ -1461,6 +1462,8 @@ namespace dace
             if (m == 2) return PI - (z + K2);
             return (z + K2) - PI;
         }
+
+        DACE_DFI float tanh(const float& x) { return dace_glibc_tanhf(x); }
 
 #endif  // device
     }  // namespace math
