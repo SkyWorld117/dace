@@ -554,7 +554,10 @@ def merge_maps(
             merged_entry.remove_out_connector('OUT_' + conn_to_remove)
         merged_entry.add_in_connector(edge.dst_conn, inner_map_entry.in_connectors[edge.dst_conn])
         outer_edge = next(graph.in_edges_by_connector(outer_map_entry, 'IN_' + conn_to_remove))
-        graph.add_edge(outer_edge.src, outer_edge.src_conn, merged_entry, edge.dst_conn, outer_edge.data)
+        # The outer edge remains live when its value also feeds the map body.
+        # Each edge must own its memlet, including this new dynamic-range edge.
+        graph.add_edge(outer_edge.src, outer_edge.src_conn, merged_entry, edge.dst_conn,
+                       copy.deepcopy(outer_edge.data))
         if remove_conn:
             graph.remove_edge(outer_edge)
 
