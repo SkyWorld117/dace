@@ -812,6 +812,14 @@ namespace dace
         {
             return std::atanh(a);
         }
+#ifdef __CUDACC__
+        // CUDA complex values use Thrust; std::sqrt accepts std::complex only.
+        template<typename T>
+        DACE_HDFI thrust::complex<T> sqrt(const thrust::complex<T>& a)
+        {
+            return thrust::sqrt(a);
+        }
+#endif
         template<typename T>
         DACE_CONSTEXPR DACE_HDFI T sqrt(const T& a)
         {
@@ -822,6 +830,14 @@ namespace dace
         {
             return std::cbrt(a);
         }
+#ifdef __CUDACC__
+        // CUDA complex values use Thrust; std::log accepts std::complex only.
+        template<typename T>
+        DACE_HDFI thrust::complex<T> log(const thrust::complex<T>& a)
+        {
+            return thrust::log(a);
+        }
+#endif
         template<typename T>
         DACE_CONSTEXPR DACE_HDFI T log(const T& a)
         {
