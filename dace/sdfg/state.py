@@ -4039,9 +4039,12 @@ class ConditionalBlock(AbstractControlFlowRegion):
                 replace_in_codeblock(cond, repl)
 
     def to_json(self, parent=None):
-        json = super().to_json(parent)
-        del json['nodes']
-        del json['edges']
+        # The graph traversal serializes branches as nodes, which we would
+        # discard and serialize again below. At depth N that takes 2**N visits.
+        # Keep the common block metadata and emit each branch only once.
+        json = ControlFlowBlock.to_json(self, parent)
+        json['cfg_list_id'] = int(self.cfg_id)
+        json['start_block'] = self._start_block
         json['branches'] = [(condition.to_json() if condition is not None else None, cfg.to_json())
                             for condition, cfg in self._branches]
         return json
