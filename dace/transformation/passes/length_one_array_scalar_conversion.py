@@ -40,7 +40,7 @@ import itertools
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import dace
-from dace import Memlet, dtypes, properties, subsets
+from dace import Memlet, dtypes, properties, subsets, symbolic
 from dace.properties import CodeBlock
 from dace.sdfg import SDFG, SDFGState, InterstateEdge, nodes, utils as sdutil
 from dace.sdfg.state import ConditionalBlock, LoopRegion
@@ -115,9 +115,17 @@ class ScalarRefRewriter(ast.NodeTransformer):
 
     def visit_Subscript(self, node: ast.Subscript):
         index = node.slice.value if isinstance(node.slice, ast.Index) else node.slice
-        if (isinstance(node.value, ast.Name) and node.value.id in self.rename and isinstance(index, ast.Constant)
-                and index.value == 0):
-            return ast.copy_location(ast.Name(id=self.rename[node.value.id], ctx=node.ctx), node)
+        if isinstance(node.value, ast.Name) and node.value.id in self.rename:
+            zero = isinstance(index, ast.Constant) and index.value == 0
+            if not zero and isinstance(index, (ast.BinOp, ast.UnaryOp)):
+                # Offset specialization leaves source AST such as ``a[1 - 1]``
+                # even though its memlet is already the constant element zero.
+                try:
+                    zero = symbolic.pystr_to_symbolic(ast.unparse(index)) == 0
+                except (SyntaxError, TypeError, ValueError, ZeroDivisionError):
+                    zero = False
+            if zero:
+                return ast.copy_location(ast.Name(id=self.rename[node.value.id], ctx=node.ctx), node)
         return self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name):

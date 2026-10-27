@@ -211,16 +211,14 @@ def test_forward_then_inverse_stays_correct():
     assert _run(sdfg, 3.0) == pytest.approx(6.0)
 
 
-def test_repeated_forward_finds_new_name_and_stays_correct():
-    """Applying the forward pass twice must not collide on the scalar name it created before
-    (``find_new_name``), and stays numerically correct."""
+def test_repeated_forward_is_idempotent_and_stays_correct():
+    """Already-staged signature buffers must not gain another copy hop on a rerun."""
     sdfg = _io_sdfg()
     ConvertLengthOneArraysToScalars(preserve_abi=True).apply_pass(sdfg, {})
     before = set(sdfg.arrays)
-    ConvertLengthOneArraysToScalars(preserve_abi=True).apply_pass(sdfg, {})
-    fresh = set(sdfg.arrays) - before
-    assert fresh, "second application created no fresh staging scalar"
-    assert all(f.startswith("scal_") for f in fresh)  # uniquified, not a collision
+    result = ConvertLengthOneArraysToScalars(preserve_abi=True).apply_pass(sdfg, {})
+    assert result is None
+    assert set(sdfg.arrays) == before
     sdfg.validate()
     assert _run(sdfg, 3.0) == pytest.approx(6.0)
 
@@ -509,3 +507,15 @@ def test_arrayize_rewrites_conditional_guard_after_branch_removal():
 
     assert isinstance(sdfg.arrays['arr'], dace.data.Array)
     assert 'arr[0]' in cond.branches[0][0].as_string, cond.branches[0][0].as_string
+
+
+@pytest.mark.parametrize("index", ["1 - 1", "-(2 - 2)", "3 + -3", "2 * (4 - 4)"])
+def test_scalar_reference_accepts_provably_zero_offset_arithmetic(index):
+    from dace.transformation.passes.length_one_array_scalar_conversion import rewrite_refs
+    assert rewrite_refs(f"out[{index}] > 2", {"out": "scal_out"}) == "scal_out > 2"
+
+
+def test_scalar_reference_retains_nonzero_or_unknown_indices():
+    from dace.transformation.passes.length_one_array_scalar_conversion import rewrite_refs
+    assert rewrite_refs("out[2 - 1]", {"out": "scal_out"}) == "scal_out[2 - 1]"
+    assert rewrite_refs("out[i - 1]", {"out": "scal_out"}) == "scal_out[i - 1]"
