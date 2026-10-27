@@ -491,10 +491,16 @@ class LoopToMap(xf.MultiStateTransformation):
 
         # Two injective writes still collide across iterations (``A[5*i]``, ``A[3*i]`` at 15).
         for data, mmlts in write_memlets.items():
-            distinct: Dict[str, memlet.Memlet] = {}
+            distinct: Dict[object, memlet.Memlet] = {}
             for m in mmlts:
                 if m.wcr is None:
-                    distinct.setdefault(str(m.subset), m)
+                    # Formatting propagated symbolic bounds can expand a shared
+                    # expression tree enormously. Structural keys retain the
+                    # complete range and tile sizes without invoking printers.
+                    subset = m.subset
+                    key = None if subset is None else (tuple(subset.ndrange()),
+                                                       tuple(getattr(subset, 'tile_sizes', ())))
+                    distinct.setdefault(key, m)
             reps = list(distinct.values())
             for x in range(len(reps)):
                 for y in range(x + 1, len(reps)):

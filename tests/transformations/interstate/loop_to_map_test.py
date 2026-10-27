@@ -1354,3 +1354,33 @@ def test_a_break_of_the_loop_itself_keeps_it_a_loop():
     sdfg = inner_break_sdfg(own_break=True)
     outer = next(r for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.label == "outer")
     assert not LoopToMap.can_be_applied_to(sdfg, loop=outer)
+
+
+def test_write_deduplication_does_not_format_symbolic_ranges(monkeypatch):
+    sdfg = dace.SDFG("duplicate_iteration_writes")
+    sdfg.add_array("A", [10], dace.int32)
+    loop = LoopRegion("loop", condition_expr="i < 10", loop_var="i",
+                      initialize_expr="i = 0", update_expr="i = i + 1")
+    sdfg.add_node(loop, is_start_block=True)
+    first = loop.add_state("first", is_start_block=True)
+    second = loop.add_state("second")
+    loop.add_edge(first, second, dace.InterstateEdge())
+    for state, value in [(first, 1), (second, 2)]:
+        tasklet = state.add_tasklet("write", {}, {"out"}, f"out = {value}")
+        state.add_edge(tasklet, "out", state.add_write("A"), None, dace.Memlet("A[i]"))
+
+    original = dace.subsets.Range.__str__
+    def refuse_analysis_formatting(subset):
+        import inspect
+        caller = inspect.currentframe().f_back
+        if caller.f_code.co_name == "can_be_applied" and caller.f_code.co_filename.endswith("loop_to_map.py"):
+            raise AssertionError("dependence analysis must not stringify write subsets")
+        return original(subset)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dace.subsets.Range, "__str__", refuse_analysis_formatting)
+        assert sdfg.apply_transformations_repeated(LoopToMap, validate=False) == 1
+    sdfg.validate()
+    output = np.zeros(10, dtype=np.int32)
+    sdfg(A=output)
+    np.testing.assert_array_equal(output, np.full(10, 2, dtype=np.int32))
