@@ -30,6 +30,28 @@ def _get_or_eval_sdfg_first_arg(func, sdfg):
     return func
 
 
+def constant_as_stored(desc: data.Array, value: Any) -> np.ndarray:
+    """The elements of constant ``value`` in the order ``desc`` lays them out in memory.
+
+    ``value`` holds the elements by index, and the code reads element ``i`` at ``sum(i * strides)``: a Fortran-ordered
+    constant written in index order reads its transpose. A value that is not of the descriptor's shape, or a
+    descriptor with symbolic strides, is written in index order.
+    """
+    value = np.asarray(value)
+    try:
+        shape = tuple(int(extent) for extent in desc.shape)
+        strides = tuple(int(stride) for stride in desc.strides)
+        size = int(desc.total_size)
+    except TypeError:
+        return value
+    if value.shape != shape or not value.size:
+        return value
+    offsets = sum(index * stride for index, stride in zip(np.indices(shape), strides))
+    stored = np.zeros(max(size, int(offsets.max()) + 1), dtype=value.dtype)
+    stored[offsets] = value
+    return stored
+
+
 class DaCeCodeGenerator(object):
     """ DaCe code generator class that writes the generated code for SDFG
         state machines, and uses a dispatcher to generate code for
@@ -114,16 +136,15 @@ class DaCeCodeGenerator(object):
         """
         pass
 
-    def generate_constants(self, sdfg: SDFG, callsite_stream: CodeIOStream):
-        # Write constants
+    def generate_constants(self, sdfg: SDFG, callsite_stream: CodeIOStream, names: Optional[Set[str]] = None):
+        # A target may need only the constants its current execution scope reads.
         for cstname, (csttype, cstval) in sdfg.constants_prop.items():
+            if names is not None and cstname not in names:
+                continue
             if isinstance(csttype, data.Array):
-                const_str = "constexpr " + csttype.dtype.ctype + " " + cstname + "[" + str(cstval.size) + "] = {"
-                it = np.nditer(cstval, order='C')
-                for i in range(cstval.size - 1):
-                    const_str += str(it[0]) + ", "
-                    it.iternext()
-                const_str += str(it[0]) + "};\n"
+                stored = constant_as_stored(csttype, cstval)
+                const_str = "constexpr " + csttype.dtype.ctype + " " + cstname + "[" + str(stored.size) + "] = {"
+                const_str += ", ".join(str(value) for value in stored.flat) + "};\n"
                 callsite_stream.write(const_str, sdfg)
             else:
                 callsite_stream.write("constexpr %s %s = %s;\n" % (csttype.dtype.ctype, cstname, sym2cpp(cstval)), sdfg)

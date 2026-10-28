@@ -714,6 +714,8 @@ class ExpandTransformation(PatternTransformation):
                                               debuginfo=node.debuginfo)
         elif isinstance(expansion, nd.CodeNode):
             expansion.debuginfo = node.debuginfo
+            if expansion not in state.nodes():
+                state.add_node(expansion)
             if isinstance(expansion, nd.NestedSDFG):
                 # Fix parent references
                 nsdfg = expansion.sdfg

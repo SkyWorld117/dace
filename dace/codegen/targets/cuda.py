@@ -104,9 +104,9 @@ class CUDACodeGen(TargetCodeGenerator):
         self._scope_has_collaborative_copy = False
         self._localcode = CodeIOStream()
         self._globalcode = CodeIOStream()
-        # SDFGs whose constant block has already been emitted at file scope.  See
-        # `generate_kernel_scope`: the identical block would otherwise be re-emitted inside every
-        # kernel (byte-for-byte dead duplication that made a many-kernel TU uncompilable).
+        # Nested SDFGs whose shared constant block has been emitted. Device-indexed
+        # arrays are also declared in their kernel scope; unrelated scalar constants
+        # must not be repeated in every kernel of a large translation unit.
         self._emitted_constant_sdfgs: set = set()
         self._initcode = CodeIOStream()
         self._exitcode = CodeIOStream()
@@ -1910,21 +1910,22 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
             (maxnreg_str, launch_bounds, kernel_name, ', '.join(kernel_args_typed + extra_kernel_args_typed)), cfg,
             state_id, node)
 
-        # Write constant expressions in GPU code.
-        #
-        # DaCe's `generate_constants` walks `sdfg.constants_prop`, and `generate_fileheader`
-        # (framecode.py) already emits the TOP-LEVEL SDFG's whole block ONCE at namespace scope of
-        # this same `.cu`.  Re-emitting it here put the identical block *inside every kernel body*
-        # (it is written after the `__global__ void ... {` on the line above): measured on
-        # face_wrf_core, 706 distinct constants x 158 kernels + the fileheader = 112,356 `constexpr`
-        # lines, i.e. the per-kernel copies are 99% of the generated CUDA.  For a large fused SDFG
-        # (the whole-step program folds ~15k config constants and has >200 kernels) that inflated the
-        # `.cu` to 152 MB and made `nvcc` spend >40 min in `cicc` before it was killed -- the fused
-        # step was uncompilable for a purely mechanical reason.
-        #
-        # Fix: for the top-level SDFG emit NOTHING here (the fileheader's namespace-scope copy is
-        # already visible to every kernel).  A genuinely different NESTED SDFG's constants are not in
-        # that block, so emit those once each, at namespace scope (`_globalcode`), never per kernel.
+        # Scalar constexpr values are visible from the translation-unit header. Arrays
+        # need device-addressable storage: a namespace-scope host constexpr array cannot
+        # be indexed dynamically by a kernel. Keep only arrays read by this scope local,
+        # without repeating the potentially thousands of unrelated scalar constants.
+        used_constants = set()
+        for edge in dfg_scope.edges():
+            if edge.data.data:
+                used_constants.add(edge.data.data)
+            used_constants.update(str(sym) for sym in edge.data.free_symbols)
+        for inner_node in dfg_scope.nodes():
+            used_constants.update(str(sym) for sym in inner_node.free_symbols)
+        array_constants = {name for name, (desc, _) in sdfg.constants_prop.items()
+                           if isinstance(desc, dt.Array) and name in used_constants}
+        self._frame.generate_constants(sdfg, self._localcode, names=array_constants)
+
+        # Preserve the one-time namespace emission for constants of a distinct SDFG.
         if sdfg is not self._global_sdfg and id(sdfg) not in self._emitted_constant_sdfgs:
             self._emitted_constant_sdfgs.add(id(sdfg))
             self._frame.generate_constants(sdfg, self._globalcode)

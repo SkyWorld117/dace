@@ -129,9 +129,10 @@ class ReloadableDLL(object):
                 #  overwrite a file that already exists.
                 lib_filename = self._library_filename + f'_{counter}'
                 counter += 1
-                if pathlib.Path(lib_filename).exists():
+                while pathlib.Path(lib_filename).exists():
                     assert pathlib.Path(lib_filename).is_file()
-                    continue
+                    lib_filename = self._library_filename + f'_{counter}'
+                    counter += 1
 
                 # The file name is not taken, so make a copy. There might be a race condition
                 #  here in the presence of multiple processes.

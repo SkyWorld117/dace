@@ -72,11 +72,15 @@ class ExpandGerPure(ExpandTransformation):
         )
 
         outshape = arrays['_res'].shape
-        nsdfg_node = nodes.NestedSDFG(node.label, sdfg, set(inputs), set(outputs), {
-            'M': outshape[0],
-            'N': outshape[1],
-            'alpha': node.alpha
-        })
+        # Bind descriptor extents/strides as well as the operation's own symbols.
+        # Sequence-associated operands carry parent symbols in their view descriptors;
+        # constructing NestedSDFG directly leaves those names undeclared in its body.
+        nsdfg_node = parent_state.add_nested_sdfg(sdfg, dict.fromkeys(inputs), dict.fromkeys(outputs),
+                                                symbol_mapping={
+                                                    'M': outshape[0],
+                                                    'N': outshape[1],
+                                                    'alpha': node.alpha
+                                                }, name=node.label)
 
         return nsdfg_node
 

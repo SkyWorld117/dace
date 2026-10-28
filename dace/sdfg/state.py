@@ -762,7 +762,7 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
         for desc in sdfg.arrays.values():
             for sym in desc.free_symbols:
                 if sym.dtype is not None:
-                    defined_syms[str(sym)] = sym.dtype
+                    defined_syms.setdefault(str(sym), sym.dtype)
 
         # Add inter-state symbols
         try:

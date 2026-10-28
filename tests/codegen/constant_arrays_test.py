@@ -139,6 +139,29 @@ def test_constant_of_a_nested_sdfg_in_a_gpu_kernel_generates():
     code = sdfg.generate_code()
     assert any("W" in c.clean_code for c in code)
 
+def test_a_column_major_constant_is_read_by_index():
+    """A constant is written in its descriptor's memory order: written in index order, a column-major table was read
+    as its transpose."""
+    table = np.arange(6, dtype=np.float64).reshape(2, 3)
+    sdfg = dace.SDFG("column_major_constant")
+    sdfg.add_array("T", [2, 3], dace.float64, strides=[1, 2], transient=True)
+    sdfg.add_constant("T", table, sdfg.arrays["T"])
+    sdfg.add_array("out", [2, 3], dace.float64)
+    sdfg.add_state().add_mapped_tasklet(
+        "read",
+        {"i": "0:2", "j": "0:3"},
+        {"t": dace.Memlet("T[i, j]")},
+        "o = t",
+        {"o": dace.Memlet("out[i, j]")},
+        external_edges=True,
+    )
+    out = np.zeros((2, 3))
+
+    sdfg(out=out)
+
+    np.testing.assert_array_equal(out, table)
+
+
 if __name__ == "__main__":
     test_nsdfg_input()
     test_tasklet_input_cpu()
