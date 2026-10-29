@@ -232,9 +232,12 @@ DACE_CONSTEXPR __device__ __forceinline__ dace::float16 max(const T& a, const da
 // https://stackoverflow.com/a/39304947
 template <typename T, std::enable_if_t<std::is_integral<T>::value && std::is_signed<T>::value>* = nullptr>
 static DACE_CONSTEXPR DACE_HDFI T int_floor_ni(const T& numerator, const T& denominator) {
-    auto divresult = std::div(numerator, denominator);
-    T corr = (divresult.rem != 0 && ((divresult.rem < 0) != (denominator < 0)));
-    return (T)divresult.quot - corr;
+    // Native operators are valid on both CPU and GPU; std::div is host-only
+    // in CUDA's standard library. Compilers can combine the quotient/remainder.
+    T quotient = numerator / denominator;
+    T remainder = numerator % denominator;
+    T corr = (remainder != 0 && ((remainder < 0) != (denominator < 0)));
+    return quotient - corr;
 }
 template <typename T, std::enable_if_t<std::is_integral<T>::value && std::is_unsigned<T>::value>* = nullptr>
 static DACE_CONSTEXPR DACE_HDFI T int_floor_ni(const T& numerator, const T& denominator) {
@@ -325,9 +328,8 @@ static DACE_CONSTEXPR DACE_HDFI T logical_right_shift(const T& x, const T& n) {
 // Computes C/C++ divmod (std::div)
 template<typename T, std::enable_if_t<std::is_integral<T>::value && std::is_signed<T>::value>* = nullptr>
 static DACE_CONSTEXPR DACE_HDFI void cpp_divmod(const T& numerator, const T& denominator, T& quotient, T& remainder) {
-    auto divresult = std::div(numerator, denominator);
-    quotient = (T)divresult.quot;
-    remainder = (T)divresult.rem;
+    quotient = numerator / denominator;
+    remainder = numerator % denominator;
 }
 template<typename T, std::enable_if_t<std::is_integral<T>::value && std::is_unsigned<T>::value>* = nullptr>
 static DACE_CONSTEXPR DACE_HDFI void cpp_divmod(const T& numerator, const T& denominator, T& quotient, T& remainder) {
