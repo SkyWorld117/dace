@@ -628,11 +628,22 @@ namespace dace
             return result;
         }
 
+        // Repeated squaring keeps integer powers logarithmic and avoids the
+        // extra rounding of a linear multiply chain (notably for real x**4).
+        // Vector codegen handles exponent zero separately; vectors without a
+        // scalar constructor retain the b >= 1 contract.
         template<typename T>
         DACE_HDFI T ipow(const T& a, const unsigned int& b) {
+            if constexpr (std::is_constructible<T, int>::value) {
+                if (b == 0) return T(1);
+            }
             T result = a;
-            for (unsigned int i = 1; i < b; ++i)
-                result *= a;
+            unsigned int bit = 1;
+            while (bit <= b / 2) bit <<= 1;
+            for (bit >>= 1; bit != 0; bit >>= 1) {
+                result *= result;
+                if (b & bit) result *= a;
+            }
             return result;
         }
 
