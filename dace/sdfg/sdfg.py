@@ -3,6 +3,7 @@ import ast
 import collections
 import copy
 import ctypes
+import functools
 import gzip
 from numbers import Integral
 import os
@@ -277,6 +278,12 @@ class LogicalGroup(object):
         return ret
 
 
+@functools.lru_cache(maxsize=16384, typed=True)
+def assignment_rhs_symbol_names(rhs: str) -> frozenset[str]:
+    """Names read by an assignment RHS, cached by text across graph traversals."""
+    return frozenset(map(str, dace.symbolic.symbols_in_ast(ast.parse(rhs))))
+
+
 @make_properties
 class InterstateEdge(object):
     """ An SDFG state machine edge. These edges can contain a condition
@@ -393,7 +400,7 @@ class InterstateEdge(object):
         rhs_symbols = set()
         for lhs, rhs in self.assignments.items():
             # Always add LHS symbols to the set of candidate free symbols
-            rhs_symbols |= set(map(str, dace.symbolic.symbols_in_ast(ast.parse(rhs))))
+            rhs_symbols |= assignment_rhs_symbol_names(rhs)
             # Add the RHS to the set of candidate defined symbols ONLY if it has not been read yet
             # This also solves the ordering issue that may arise in cases like the 3rd example above
             if lhs not in cond_symbols and lhs not in rhs_symbols:
@@ -1516,13 +1523,16 @@ class SDFG(ControlFlowRegion):
                 if isinstance(node, nd.NestedSDFG):
                     yield from node.sdfg.arrays_recursive(include_nested_data=include_nested_data)
 
-    def _used_symbols_internal(self,
-                               all_symbols: bool,
-                               defined_syms: Optional[Set] = None,
-                               free_syms: Optional[Set] = None,
-                               used_before_assignment: Optional[Set] = None,
-                               keep_defined_in_mapping: bool = False,
-                               with_contents: bool = True) -> Tuple[Set[str], Set[str], Set[str]]:
+    def _used_symbols_internal(
+        self,
+        all_symbols: bool,
+        defined_syms: set | None = None,
+        free_syms: set | None = None,
+        used_before_assignment: set | None = None,
+        keep_defined_in_mapping: bool = False,
+        with_contents: bool = True,
+        partially_defined: set | None = None,
+    ) -> tuple[set[str], set[str], set[str]]:
         defined_syms = set() if defined_syms is None else defined_syms
         free_syms = set() if free_syms is None else free_syms
         used_before_assignment = set() if used_before_assignment is None else used_before_assignment
@@ -1541,12 +1551,15 @@ class SDFG(ControlFlowRegion):
 
         # Snapshot the set so super() can filter array names out of
         # ``free_syms``; we re-extract them from internal references below.
-        result = super()._used_symbols_internal(all_symbols=all_symbols,
-                                                keep_defined_in_mapping=keep_defined_in_mapping,
-                                                defined_syms=defined_syms,
-                                                free_syms=free_syms,
-                                                used_before_assignment=used_before_assignment,
-                                                with_contents=with_contents)
+        result = super()._used_symbols_internal(
+            all_symbols=all_symbols,
+            keep_defined_in_mapping=keep_defined_in_mapping,
+            defined_syms=defined_syms,
+            free_syms=free_syms,
+            used_before_assignment=used_before_assignment,
+            with_contents=with_contents,
+            partially_defined=partially_defined,
+        )
         # A used array needs its stride/shape/offset symbols in the free set; a merely-declared one
         # must not leak its shape symbol into the signature (issue #2382). ``read_and_write_sets``
         # counts an array referenced only by a code-block guard as used.

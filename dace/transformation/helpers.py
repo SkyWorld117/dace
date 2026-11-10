@@ -23,7 +23,7 @@ from dace.memlet import Memlet
 from dace import typeclass
 
 
-def nest_sdfg_subgraph(sdfg: SDFG, subgraph: SubgraphView, start: Optional[SDFGState] = None) -> SDFGState:
+def nest_sdfg_subgraph(sdfg: SDFG, subgraph: SubgraphView, start: SDFGState | None = None) -> SDFGState:
     """
     Nests an SDFG subgraph (SDFGStates and InterstateEdges).
 
@@ -34,20 +34,19 @@ def nest_sdfg_subgraph(sdfg: SDFG, subgraph: SubgraphView, start: Optional[SDFGS
     """
 
     # Nest states
-    blocks: List[ControlFlowBlock] = subgraph.nodes()
+    blocks: list[ControlFlowBlock] = subgraph.nodes()
     return_state = None
     if len(blocks) > 1 or isinstance(blocks[0], AbstractControlFlowRegion):
-        # Avoid cyclic imports
-        from dace.transformation.passes.analysis import loop_analysis
-
         graph: ControlFlowRegion = blocks[0].parent_graph
         if start is not None:
             source_node = start
         else:
             src_nodes = subgraph.source_nodes()
             if len(src_nodes) != 1:
-                raise ValueError('Ambiguous start state of the SDFG subgraph. '
-                                 'Please provide the start state via the "start" argument.')
+                raise ValueError(
+                    "Ambiguous start state of the SDFG subgraph. "
+                    'Please provide the start state via the "start" argument.'
+                )
             source_node = src_nodes[0]
 
         sink_nodes = subgraph.sink_nodes()
@@ -55,25 +54,22 @@ def nest_sdfg_subgraph(sdfg: SDFG, subgraph: SubgraphView, start: Optional[SDFGS
             raise NotImplementedError
         sink_node = sink_nodes[0]
 
-        all_blocks: List[ControlFlowBlock] = []
-        is_edges: List[Edge[InterstateEdge]] = []
+        all_blocks: list[ControlFlowBlock] = []
+        is_edges: list[Edge[InterstateEdge]] = []
         for b in blocks:
             if isinstance(b, AbstractControlFlowRegion):
                 all_blocks.append(b)
-                for nb in b.all_control_flow_blocks():
-                    all_blocks.append(nb)
-                for e in b.all_interstate_edges():
-                    is_edges.append(e)
+                all_blocks.extend(b.all_control_flow_blocks())
+                is_edges.extend(b.all_interstate_edges())
             else:
                 all_blocks.append(b)
-        states: List[SDFGState] = [b for b in all_blocks if isinstance(b, SDFGState)]
+        states: list[SDFGState] = [b for b in all_blocks if isinstance(b, SDFGState)]
         for src in blocks:
             for dst in blocks:
-                for edge in graph.edges_between(src, dst):
-                    is_edges.append(edge)
-        return_blocks: Set[ReturnBlock] = set([b for b in all_blocks if isinstance(b, ReturnBlock)])
+                is_edges.extend(graph.edges_between(src, dst))
+        return_blocks: set[ReturnBlock] = {b for b in all_blocks if isinstance(b, ReturnBlock)}
         if len(return_blocks) > 0:
-            did_return_inner = '_did_ret_from_nsdfg'
+            did_return_inner = "_did_ret_from_nsdfg"
             did_return_inner = sdfg._find_new_name(did_return_inner)
             sdfg.add_scalar(did_return_inner, dtypes.int32, transient=True)
         else:
@@ -114,60 +110,16 @@ def nest_sdfg_subgraph(sdfg: SDFG, subgraph: SubgraphView, start: Optional[SDFGS
                     if s in sdfg.arrays:
                         read_set.add(s)
 
-        # Find NestedSDFG's unique data
-        rw_set = read_set | write_set
-        unique_set = set()
-        for name in rw_set:
-            if not sdfg.arrays[name].transient:
-                continue
-            found = False
-            for state in sdfg.states():
-                if state in blocks:
-                    continue
-                for node in state.nodes():
-                    if (isinstance(node, nodes.AccessNode) and node.data == name):
-                        found = True
-                        break
-            if not found:
-                unique_set.add(name)
-
-        # Find NestedSDFG's connectors
-        read_set = {n for n in read_set if n not in unique_set or not sdfg.arrays[n].transient}
-        write_set = {n for n in write_set if n not in unique_set or not sdfg.arrays[n].transient}
-
-        # Find defined subgraph symbols
-        defined_symbols = set()
-        strictly_defined_symbols = set()
-        for e in is_edges:
-            defined_symbols.update(set(e.data.assignments.keys()))
-            for k, v in e.data.assignments.items():
-                try:
-                    if k not in sdfg.symbols and k not in {str(a) for a in symbolic.pystr_to_symbolic(v).args}:
-                        strictly_defined_symbols.add(k)
-                except AttributeError:
-                    # `symbolic.pystr_to_symbolic` may return bool, which doesn't have attribute `args`
-                    pass
-        for b in all_blocks:
-            if isinstance(b, LoopRegion) and b.loop_variable:
-                defined_symbols.add(b.loop_variable)
-                if b.loop_variable not in sdfg.symbols:
-                    if b.init_statement:
-                        init_assignment = loop_analysis.get_init_assignment(b)
-                        if b.loop_variable not in {str(s) for s in symbolic.pystr_to_symbolic(init_assignment).args}:
-                            strictly_defined_symbols.add(b.loop_variable)
-                    else:
-                        strictly_defined_symbols.add(b.loop_variable)
-
-        return_state = new_state = graph.add_state('nested_sdfg_parent')
+        return_state = new_state = graph.add_state("nested_sdfg_parent")
 
         # If there is a return that is being nested in, a conditional return is added right after the new nested SDFG
         # which will be taken if the inner, nested return was hit.
         ret_cond = None
         if len(return_blocks) > 0:
-            ret_cond = ConditionalBlock('return_' + sdfg.label + '_from_nested', sdfg, graph)
+            ret_cond = ConditionalBlock("return_" + sdfg.label + "_from_nested", sdfg, graph)
             graph.add_node(ret_cond, ensure_unique_name=True)
-            ret_branch = ControlFlowRegion('return_' + sdfg.label + '_from_nested_body', sdfg, ret_cond)
-            ret_block = ReturnBlock('return', sdfg, ret_branch)
+            ret_branch = ControlFlowRegion("return_" + sdfg.label + "_from_nested_body", sdfg, ret_cond)
+            ret_block = ReturnBlock("return", sdfg, ret_branch)
             ret_branch.add_node(ret_block)
             ret_cond.add_branch(CodeBlock(did_return_inner), ret_branch)
 
@@ -176,6 +128,11 @@ def nest_sdfg_subgraph(sdfg: SDFG, subgraph: SubgraphView, start: Optional[SDFGS
         nsdfg.add_nodes_from([s for s in blocks if s is not source_node])
         for e in subgraph.edges():
             nsdfg.add_edge(e.src, e.dst, e.data)
+        # SDFGs nested in the moved states now have the new SDFG as their parent
+        for state in nsdfg.states():
+            for node in state.nodes():
+                if isinstance(node, nodes.NestedSDFG):
+                    node.sdfg.parent_sdfg = nsdfg
 
         # Annotate any transitions to return blocks in the inner, nested SDFG by first setting the added transient
         # scalar to 1 / true to detect that the inner SDFG returned.
@@ -183,18 +140,18 @@ def nest_sdfg_subgraph(sdfg: SDFG, subgraph: SubgraphView, start: Optional[SDFGS
             for blk in nsdfg.all_control_flow_blocks():
                 if blk in return_blocks:
                     pre_state = blk.parent_graph.add_state_before(blk)
-                    did_ret_tasklet = pre_state.add_tasklet('__did_ret_set', {}, {'out'}, 'out = 1')
+                    did_ret_tasklet = pre_state.add_tasklet("__did_ret_set", {}, {"out"}, "out = 1")
                     did_ret_access = pre_state.add_access(did_return_inner)
-                    pre_state.add_edge(did_ret_tasklet, 'out', did_ret_access, None, Memlet(did_return_inner + '[0]'))
+                    pre_state.add_edge(did_ret_tasklet, "out", did_ret_access, None, Memlet(did_return_inner + "[0]"))
                     write_set.add(did_return_inner)
 
         if ret_cond is not None:
-            pre_state = graph.add_state('before_nested_sdfg_parent')
+            pre_state = graph.add_state("before_nested_sdfg_parent")
             for e in graph.in_edges(source_node):
                 graph.add_edge(e.src, pre_state, e.data)
-            did_ret_tasklet = pre_state.add_tasklet('__did_ret_init', {}, {'out'}, 'out = 0')
+            did_ret_tasklet = pre_state.add_tasklet("__did_ret_init", {}, {"out"}, "out = 0")
             did_ret_access = pre_state.add_access(did_return_inner)
-            pre_state.add_edge(did_ret_tasklet, 'out', did_ret_access, None, Memlet(did_return_inner + '[0]'))
+            pre_state.add_edge(did_ret_tasklet, "out", did_ret_access, None, Memlet(did_return_inner + "[0]"))
             graph.add_edge(pre_state, new_state, InterstateEdge())
             graph.add_edge(new_state, ret_cond, InterstateEdge())
             for e in graph.out_edges(sink_node):
@@ -207,50 +164,59 @@ def nest_sdfg_subgraph(sdfg: SDFG, subgraph: SubgraphView, start: Optional[SDFGS
 
         graph.remove_nodes_from(blocks)
 
-        # Add NestedSDFG arrays
+        # The blocks are gone, so what ``sdfg`` still uses is used before or after the nested SDFG
+        used_elsewhere = names_used_in(sdfg)
+
+        # Transients used nowhere else move into the nested SDFG; the other containers become its connectors
+        local_data = {n for n in read_set | write_set if sdfg.arrays[n].transient and n not in used_elsewhere}
+        read_set = OrderedSet(sorted(read_set - local_data))
+        write_set = OrderedSet(sorted(write_set - local_data))
         for name in read_set | write_set:
             nsdfg.arrays[name] = copy.deepcopy(sdfg.arrays[name])
             nsdfg.arrays[name].transient = False
-        for name in unique_set:
+        for name in local_data:
             nsdfg.arrays[name] = sdfg.arrays[name]
             del sdfg.arrays[name]
 
-        # If there are symbols (new or not) assigned value in the subgraph, their values will be propagated to the
-        # (outer) SDFG through a symbol-scalar-symbol conversion. This is happening in two parts: (1) inside the nested
-        # SDFG (symbol -> scalar), (2) in the outer SDFG, just after the SDFGState containing the NestedSDFG node
-        # (scalar -> symbol).
-        ndefined_symbols = set()
+        # The symbols the subgraph assigns that are used elsewhere leave the nested SDFG through a
+        # symbol-scalar-symbol conversion: (1) inside the nested SDFG (symbol -> scalar), (2) in the outer SDFG, just
+        # after the SDFGState containing the NestedSDFG node (scalar -> symbol).
+        assigned = {s for e in nsdfg.all_interstate_edges() for s in e.data.assignments}
+        assigned = assigned.union(*(_modified_symbols_in_region(r) for r in nsdfg.all_control_flow_regions()))
+        exported = sorted(assigned & used_elsewhere)
         out_mapping = {}
         out_state = None
-        for e in nsdfg.all_interstate_edges():
-            ndefined_symbols.update(set(e.data.assignments.keys()))
-        for b in all_blocks:
-            if isinstance(b, LoopRegion) and b.loop_variable is not None and b.loop_variable != '' and b.init_statement:
-                ndefined_symbols.add(b.loop_variable)
-        if ndefined_symbols:
-            out_state = nsdfg.add_state('symbolic_output')
+        if exported:
+            types = assigned_symbol_types(new_state, nsdfg)
+            out_state = nsdfg.add_state("symbolic_output")
             nsdfg.add_edge(sink_node, out_state, InterstateEdge())
-            for s in ndefined_symbols:
-                if s in nsdfg.symbols:
-                    dtype = nsdfg.symbols[s]
-                else:
-                    dtype = sdfg.symbols[s]
-                name, _ = sdfg.add_scalar(f"__sym_out_{s}", dtype, transient=True, find_new_name=True)
+            for s in exported:
+                dtype = types[s]
+                # The connector connects the two scalars by name, so it must be free in both SDFGs
+                name = sdfg._find_new_name(f"__sym_out_{s}")
+                suffix = 0
+                while nsdfg.is_name_used(name):
+                    name = sdfg._find_new_name(f"__sym_out_{s}_{suffix}")
+                    suffix += 1
+                sdfg.add_scalar(name, dtype, transient=True)
                 out_mapping[s] = name
-                nname, ndesc = nsdfg.add_scalar(f"__sym_out_{s}", dtype, find_new_name=True)
+                nname, ndesc = nsdfg.add_scalar(name, dtype)
                 # Part (1)
-                tasklet = out_state.add_tasklet(f"set_{nname}", {}, {'__out'}, f'__out = {s}')
+                tasklet = out_state.add_tasklet(f"set_{nname}", {}, {"__out"}, f"__out = {s}")
                 acc = out_state.add_access(nname)
-                out_state.add_edge(tasklet, '__out', acc, None, Memlet.from_array(nname, ndesc))
+                out_state.add_edge(tasklet, "__out", acc, None, Memlet.from_array(nname, ndesc))
                 write_set.add(name)
 
-        # Add NestedSDFG node
-        fsymbols = sdfg.symbols.keys() | nsdfg.free_symbols
-        fsymbols.update(defined_symbols)
-        fsymbols = fsymbols - strictly_defined_symbols
-        mapping = {s: s for s in fsymbols}
+        # Add NestedSDFG node. A symbol the subgraph assigns is passed in only if the subgraph reads it first, and is no
+        # longer declared outside if nothing else uses it.
+        incoming = nsdfg.free_symbols
+        mapping = {s: s for s in (sdfg.symbols.keys() - assigned) | incoming}
+        # A symbol the subgraph assigns keeps the type the parent declares; left to inference, ``i = 1`` is int64.
+        for s in sorted(assigned):
+            if s in sdfg.symbols and s not in nsdfg.symbols:
+                nsdfg.add_symbol(s, sdfg.symbols[s])
         cnode = new_state.add_nested_sdfg(nsdfg, read_set, write_set, mapping)
-        for s in strictly_defined_symbols:
+        for s in assigned - used_elsewhere - incoming:
             if s in sdfg.symbols:
                 sdfg.remove_symbol(s)
 
@@ -264,7 +230,7 @@ def nest_sdfg_subgraph(sdfg: SDFG, subgraph: SubgraphView, start: Optional[SDFGS
 
         # Part (2)
         if out_state is not None:
-            extra_state = graph.add_state('symbolic_output')
+            extra_state = graph.add_state("symbolic_output")
             for e in graph.out_edges(new_state):
                 graph.add_edge(extra_state, e.dst, e.data)
                 graph.remove_edge(e)
@@ -275,6 +241,31 @@ def nest_sdfg_subgraph(sdfg: SDFG, subgraph: SubgraphView, start: Optional[SDFGS
         return_state = blocks[0]
 
     return return_state
+
+def names_used_in(cfg: ControlFlowRegion) -> set[str]:
+    """The symbols and containers that any block, interstate edge or data descriptor of ``cfg`` uses. Unlike
+    ``used_symbols``, a use counts even where an earlier assignment defines the symbol."""
+    names = set()
+    for block in cfg.all_control_flow_blocks():
+        if isinstance(block, SDFGState):
+            names |= block.used_symbols(all_symbols=True) | {n.data for n in block.data_nodes()}
+        else:  # A region's own conditions; its blocks are visited separately
+            names |= block.used_symbols(all_symbols=True, with_contents=False)
+    for edge in cfg.all_interstate_edges():
+        names |= edge.data.read_symbols()
+    for desc in cfg.sdfg.arrays.values():
+        names |= {str(s) for s in desc.free_symbols}
+    return names
+
+def assigned_symbol_types(state: SDFGState, nsdfg: SDFG) -> dict[str, dtypes.typeclass]:
+    """The types of the symbols defined at ``state`` and of those ``nsdfg``, called from it, assigns. A declared type
+    wins; the others are inferred as code generation infers them."""
+    types = dict(state.defined_symbols())
+    for region in nsdfg.all_control_flow_regions():
+        types.update({k: v for k, v in region.new_symbols(types).items() if k not in types})
+    for edge in nsdfg.all_interstate_edges():
+        types.update({k: v for k, v in edge.data.new_symbols(nsdfg, types).items() if k not in types})
+    return types
 
 
 def nest_sdfg_control_flow(sdfg: SDFG):
@@ -446,17 +437,12 @@ def nest_state_subgraph(sdfg: SDFG,
         output_names[edge] = new_name
     ###################
 
-    # Add scope symbols to the nested SDFG with their original data types
+    # Parent declarations and scope iterator types override types inferred while moving descriptors.
     symbols_at_top = state.symbols_defined_at(top_scopenode)
     if isinstance(top_scopenode, nodes.EntryNode):
         symbols_at_top.update(top_scopenode.new_symbols(sdfg, state, symbols_at_top))
-    for v in (symbols_at_top.keys() | sdfg.symbols.keys()):
-        if v in nsdfg.symbols:
-            continue
-        if v in sdfg.symbols:
-            nsdfg.add_symbol(v, sdfg.symbols[v].dtype)
-        elif v in symbols_at_top:
-            nsdfg.add_symbol(v, symbols_at_top[v].dtype)
+    for name in symbols_at_top.keys() | sdfg.symbols.keys():
+        nsdfg.symbols[name] = sdfg.symbols.get(name, symbols_at_top.get(name))
 
     # Add constants to nested SDFG
     for cstname, cstval in sdfg.constants.items():

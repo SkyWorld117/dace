@@ -5,8 +5,9 @@ import ast
 import abc
 import collections
 import copy
+import functools
 import re
-import inspect
+import sys
 import itertools
 import warnings
 import sympy
@@ -56,8 +57,8 @@ def _get_debug_info(explicit_lineinfo: dtypes.DebugInfo | None) -> dtypes.DebugI
         return explicit_lineinfo
 
     if dace.Config.get("compiler", "lineinfo") == "inspect":
-        caller = inspect.getframeinfo(inspect.stack()[2][0], context=0)
-        return dtypes.DebugInfo(caller.lineno, 0, caller.lineno, 0, caller.filename)
+        caller = sys._getframe(2)
+        return dtypes.DebugInfo(caller.f_lineno, 0, caller.f_lineno, 0, caller.f_code.co_filename)
 
     return None
 
@@ -700,6 +701,7 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
         sdfg = state.sdfg
         new_symbols = set()
         freesyms = set()
+        described = set()
 
         # Free symbols from nodes
         for n in self.nodes():
@@ -707,7 +709,9 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
                 new_symbols |= set(n.new_symbols(sdfg, self, {}).keys())
             elif isinstance(n, nd.AccessNode):
                 # Add data descriptor symbols
-                freesyms |= set(map(str, n.desc(sdfg).used_symbols(all_symbols)))
+                if n.data not in described:
+                    described.add(n.data)
+                    freesyms |= set(map(str, n.desc(sdfg).used_symbols(all_symbols)))
             elif isinstance(n, nd.Tasklet):
                 if n.language == dtypes.Language.Python:
                     # Consider callbacks defined as symbols as free
@@ -772,10 +776,18 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
             start_block = None
         if isinstance(start_block, AbstractControlFlowRegion):
             update_if_not_none(defined_syms, start_block.new_symbols(defined_syms))
+        # ``new_symbols(sdfg, ...)`` rebuilds this type environment per edge; keep it alongside ``defined_syms``
+        array_types = {k: v.dtype for k, v in sdfg.arrays.items()}
+        environment = {**defined_syms, **array_types}
         for edge in sdfg.all_interstate_edges():
-            update_if_not_none(defined_syms, edge.data.new_symbols(sdfg, defined_syms))
+            if edge.data.assignments:
+                defined = {k: v for k, v in edge.data.new_symbols(None, environment).items() if v is not None}
+                defined_syms.update(defined)
+                environment.update((k, array_types.get(k, v)) for k, v in defined.items())
             if isinstance(edge.dst, AbstractControlFlowRegion):
-                update_if_not_none(defined_syms, edge.dst.new_symbols(defined_syms))
+                defined = {k: v for k, v in edge.dst.new_symbols(defined_syms).items() if v is not None}
+                defined_syms.update(defined)
+                environment.update((k, array_types.get(k, v)) for k, v in defined.items())
         regions = []
         region = state.parent_graph
         while region is not None and region is not sdfg:
@@ -1157,14 +1169,17 @@ class ControlGraphView(BlockGraphView, abc.ABC):
     # Query, subgraph, and replacement methods
 
     @abc.abstractmethod
-    def _used_symbols_internal(self,
-                               all_symbols: bool,
-                               defined_syms: Optional[Set] = None,
-                               free_syms: Optional[Set] = None,
-                               used_before_assignment: Optional[Set] = None,
-                               keep_defined_in_mapping: bool = False,
-                               with_contents: bool = True) -> Tuple[Set[str], Set[str], Set[str]]:
-        raise NotImplementedError()
+    def _used_symbols_internal(
+        self,
+        all_symbols: bool,
+        defined_syms: set | None = None,
+        free_syms: set | None = None,
+        used_before_assignment: set | None = None,
+        keep_defined_in_mapping: bool = False,
+        with_contents: bool = True,
+        partially_defined: set | None = None,
+    ) -> tuple[set[str], set[str], set[str]]:
+        raise NotImplementedError
 
     def used_symbols(self,
                      all_symbols: bool,
@@ -1348,6 +1363,8 @@ class ControlFlowBlock(BlockGraphView, abc.ABC):
     @label.setter
     def label(self, label: str):
         self._label = label
+        if self._parent_graph is not None:
+            self._parent_graph._labels.add(label)
 
     @property
     def name(self) -> str:
@@ -1525,7 +1542,7 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
                     else:
                         authority_by_node[child] = authority
 
-            _open_scope(None, dict(self.sdfg.symbols))
+            _open_scope(None, self.sdfg.symbols)
         except (RuntimeError, ValueError, KeyError):
             authority_by_node = {}
 
@@ -2790,9 +2807,12 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
         """
         # TODO: Refactor
         sub_cfg_list = self._cfg_list
-        for g in cfg_list:
-            if g not in sub_cfg_list:
-                sub_cfg_list.append(g)
+        if cfg_list is not sub_cfg_list:
+            present = {id(g) for g in sub_cfg_list}
+            for g in cfg_list:
+                if id(g) not in present:
+                    present.add(id(g))
+                    sub_cfg_list.append(g)
         ptarget = None
         if isinstance(self, dace.SDFG) and self.parent_sdfg is not None:
             ptarget = self.parent_sdfg
@@ -2914,7 +2934,6 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
     def _ensure_unique_block_name(self, proposed: Optional[str] = None) -> str:
         # Ledger of issued names, refreshed every call: in-place renames keep the node count, so a
         # count guard rots.
-        self._labels = (self._labels or set()) | {s.label for s in self.nodes()}
         return dt.find_new_name(proposed or 'block', self._labels)
 
     def add_node(self,
@@ -2930,6 +2949,7 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
             node.label = self._ensure_unique_block_name(node.label)
 
         super().add_node(node)
+        self._labels.add(node.label)
         self._cached_start_block = None
         node.parent_graph = self
         if isinstance(self, dace.SDFG):
@@ -3039,32 +3059,56 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
     ###################################################################
     # Traversal methods
 
-    def all_control_flow_regions(self,
-                                 recursive=False,
-                                 load_ext=False,
-                                 parent_first=True) -> Iterator['AbstractControlFlowRegion']:
-        """ Iterate over this and all nested control flow regions. """
+    def all_control_flow_regions(
+        self, recursive=False, load_ext=False, parent_first=True
+    ) -> Iterator["AbstractControlFlowRegion"]:
+        """Iterate over this and all nested control flow regions."""
         if parent_first:
-            yield self
+            yield from self.control_flow_regions_preorder(recursive, load_ext)
+            return
         for block in self.nodes():
             if isinstance(block, SDFGState) and recursive:
                 for node in block.nodes():
                     if isinstance(node, nd.NestedSDFG):
                         if node.sdfg:
-                            yield from node.sdfg.all_control_flow_regions(recursive=recursive,
-                                                                          load_ext=load_ext,
-                                                                          parent_first=parent_first)
+                            yield from node.sdfg.all_control_flow_regions(
+                                recursive=recursive, load_ext=load_ext, parent_first=parent_first
+                            )
                         elif load_ext:
                             node.load_external(block)
-                            yield from node.sdfg.all_control_flow_regions(recursive=recursive,
-                                                                          load_ext=load_ext,
-                                                                          parent_first=parent_first)
+                            yield from node.sdfg.all_control_flow_regions(
+                                recursive=recursive, load_ext=load_ext, parent_first=parent_first
+                            )
             elif isinstance(block, AbstractControlFlowRegion):
-                yield from block.all_control_flow_regions(recursive=recursive,
-                                                          load_ext=load_ext,
-                                                          parent_first=parent_first)
+                yield from block.all_control_flow_regions(
+                    recursive=recursive, load_ext=load_ext, parent_first=parent_first
+                )
         if not parent_first:
             yield self
+
+    def control_flow_regions_preorder(self, recursive: bool, load_ext: bool) -> Iterator["AbstractControlFlowRegion"]:
+        """``all_control_flow_regions(parent_first=True)`` with an explicit stack instead of one generator per level."""
+        yield self
+        # (remaining items, their state, or None for a region's blocks)
+        stack: list[tuple[Iterator[Any], SDFGState | None]] = [(iter(self.nodes()), None)]
+        while stack:
+            items, owner = stack[-1]
+            item = next(items, None)
+            if item is None:
+                stack.pop()
+            elif owner is not None:
+                if isinstance(item, nd.NestedSDFG):
+                    if not item.sdfg and load_ext:
+                        item.load_external(owner)
+                    if item.sdfg:
+                        yield item.sdfg
+                        stack.append((iter(item.sdfg.nodes()), None))
+            elif isinstance(item, SDFGState):
+                if recursive and item.number_of_nodes() > 0:
+                    stack.append((iter(item.nodes()), item))
+            elif isinstance(item, AbstractControlFlowRegion):
+                yield item
+                stack.append((iter(item.nodes()), None))
 
     def all_sdfgs_recursive(self, load_ext=False) -> Iterator['SDFG']:
         """ Iterate over this and all nested SDFGs. """
@@ -3095,16 +3139,22 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
     ###################################################################
     # Inherited / Overrides
 
-    def _used_symbols_internal(self,
-                               all_symbols: bool,
-                               defined_syms: Optional[Set] = None,
-                               free_syms: Optional[Set] = None,
-                               used_before_assignment: Optional[Set] = None,
-                               keep_defined_in_mapping: bool = False,
-                               with_contents: bool = True) -> Tuple[Set[str], Set[str], Set[str]]:
+    def _used_symbols_internal(
+        self,
+        all_symbols: bool,
+        defined_syms: set | None = None,
+        free_syms: set | None = None,
+        used_before_assignment: set | None = None,
+        keep_defined_in_mapping: bool = False,
+        with_contents: bool = True,
+        partially_defined: set | None = None,
+    ) -> tuple[set[str], set[str], set[str]]:
         defined_syms = set() if defined_syms is None else defined_syms
         free_syms = set() if free_syms is None else free_syms
         used_before_assignment = set() if used_before_assignment is None else used_before_assignment
+        # The symbols in ``defined_syms`` only some paths assign (one arm of a conditional): a read still needs the
+        # caller's value
+        partially_defined = set() if partially_defined is None else partially_defined
 
         if with_contents:
             try:
@@ -3116,8 +3166,14 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
                 state_symbols = set()
                 if isinstance(block, (ControlFlowRegion, ConditionalBlock)):
                     b_free_syms, b_defined_syms, b_used_before_syms = block._used_symbols_internal(
-                        all_symbols, defined_syms, free_syms, used_before_assignment, keep_defined_in_mapping,
-                        with_contents)
+                        all_symbols,
+                        defined_syms,
+                        free_syms,
+                        used_before_assignment,
+                        keep_defined_in_mapping,
+                        with_contents,
+                        partially_defined=partially_defined,
+                    )
                     free_syms |= b_free_syms
                     defined_syms |= b_defined_syms
                     used_before_assignment |= b_used_before_syms
@@ -3125,6 +3181,8 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
                 else:
                     state_symbols = block.used_symbols(all_symbols, keep_defined_in_mapping, with_contents)
                     free_syms |= state_symbols
+                    # A block reading a symbol nothing has assigned yet needs the caller's value
+                    used_before_assignment.update(state_symbols - (defined_syms - partially_defined))
 
                 # Add free inter-state symbols
                 for e in self.out_edges(block):
@@ -3136,8 +3194,10 @@ class AbstractControlFlowRegion(OrderedDiGraph[ControlFlowBlock, 'dace.sdfg.Inte
                     dsyms = {sym for sym in efsyms if sym in self.sdfg.arrays}
                     for d in dsyms:
                         efsyms |= {str(sym) for sym in self.sdfg.arrays[d].used_symbols(all_symbols)}
-                    defined_syms |= set(e.data.assignments.keys()) - (efsyms | state_symbols)
-                    used_before_assignment.update(efsyms - defined_syms)
+                    assigned = set(e.data.assignments.keys()) - (efsyms | state_symbols)
+                    used_before_assignment.update(efsyms - (defined_syms - partially_defined))
+                    defined_syms |= assigned
+                    partially_defined -= assigned
                     free_syms |= efsyms
 
         # Remove symbols that were used before they were assigned.
@@ -3767,13 +3827,16 @@ class LoopRegion(ControlFlowRegion):
                     border_memlets[direction][connector] = sdprop._merge_border_memlet(
                         border_memlets[direction][connector], propagated, self.sdfg.arrays[array_name])
 
-    def _used_symbols_internal(self,
-                               all_symbols: bool,
-                               defined_syms: Optional[Set] = None,
-                               free_syms: Optional[Set] = None,
-                               used_before_assignment: Optional[Set] = None,
-                               keep_defined_in_mapping: bool = False,
-                               with_contents: bool = True) -> Tuple[Set[str], Set[str], Set[str]]:
+    def _used_symbols_internal(
+        self,
+        all_symbols: bool,
+        defined_syms: set | None = None,
+        free_syms: set | None = None,
+        used_before_assignment: set | None = None,
+        keep_defined_in_mapping: bool = False,
+        with_contents: bool = True,
+        partially_defined: set | None = None,
+    ) -> tuple[set[str], set[str], set[str]]:
         defined_syms = set() if defined_syms is None else defined_syms
         free_syms = set() if free_syms is None else free_syms
         used_before_assignment = set() if used_before_assignment is None else used_before_assignment
@@ -3790,9 +3853,12 @@ class LoopRegion(ControlFlowRegion):
             cond_free_syms.remove(self.loop_variable)
 
         b_free_symbols, b_defined_symbols, b_used_before_assignment = super()._used_symbols_internal(
-            all_symbols, keep_defined_in_mapping=keep_defined_in_mapping, with_contents=with_contents)
-        outside_defined = defined_syms - used_before_assignment
-        used_before_assignment |= ((b_used_before_assignment - {self.loop_variable}) - outside_defined)
+            all_symbols, keep_defined_in_mapping=keep_defined_in_mapping, with_contents=with_contents
+        )
+        outside_defined = (
+            defined_syms - used_before_assignment - (set() if partially_defined is None else partially_defined)
+        )
+        used_before_assignment |= (b_used_before_assignment - {self.loop_variable}) - outside_defined
         free_syms |= b_free_symbols
         defined_syms |= b_defined_symbols
 
@@ -3920,6 +3986,7 @@ class ConditionalBlock(AbstractControlFlowRegion):
         if condition is not None and not isinstance(condition, CodeBlock):
             condition = CodeBlock(condition)
         self._branches.append([condition, branch])
+        self._labels.add(branch.label)
         branch.parent_graph = self
         branch.sdfg = self.sdfg
         # A branch is reached only through this list, never through ``nodes()``, so the generic
@@ -3996,25 +4063,49 @@ class ConditionalBlock(AbstractControlFlowRegion):
                     border_memlets[direction][connector] = sdprop._merge_border_memlet_upper_bound(
                         border_memlets[direction][connector], propagated, self.sdfg.arrays[array_name])
 
-    def _used_symbols_internal(self,
-                               all_symbols: bool,
-                               defined_syms: Optional[Set] = None,
-                               free_syms: Optional[Set] = None,
-                               used_before_assignment: Optional[Set] = None,
-                               keep_defined_in_mapping: bool = False,
-                               with_contents: bool = True) -> Tuple[Set[str], Set[str], Set[str]]:
+    def _used_symbols_internal(
+        self,
+        all_symbols: bool,
+        defined_syms: set | None = None,
+        free_syms: set | None = None,
+        used_before_assignment: set | None = None,
+        keep_defined_in_mapping: bool = False,
+        with_contents: bool = True,
+        partially_defined: set | None = None,
+    ) -> tuple[set[str], set[str], set[str]]:
         defined_syms = set() if defined_syms is None else defined_syms
         free_syms = set() if free_syms is None else free_syms
         used_before_assignment = set() if used_before_assignment is None else used_before_assignment
 
+        partially_defined = set() if partially_defined is None else partially_defined
+
+        # Only one branch runs: each starts from the entry set.
+        entry_defined, entry_partial = set(defined_syms), set(partially_defined)
+        # Assigned on every path through the block; without an else arm, also on the path that skips every branch
+        conditions = tuple(condition.as_string for condition, _ in self._branches if condition is not None)
+        has_else = len(conditions) < len(self._branches) or last_condition_negates_the_others(conditions)
+        must_defined: set[str] | None = None if has_else else entry_defined - entry_partial
         for condition, region in self._branches:
+            branch_defined, branch_partial = set(entry_defined), set(entry_partial)
             if condition is not None:
-                free_syms |= condition.get_free_symbols(defined_syms)
+                free_syms |= condition.get_free_symbols(branch_defined)
             b_free_symbols, b_defined_symbols, b_used_before_assignment = region._used_symbols_internal(
-                all_symbols, defined_syms, free_syms, used_before_assignment, keep_defined_in_mapping, with_contents)
+                all_symbols,
+                branch_defined,
+                free_syms,
+                used_before_assignment,
+                keep_defined_in_mapping,
+                with_contents,
+                partially_defined=branch_partial,
+            )
             free_syms |= b_free_symbols
             defined_syms |= b_defined_symbols
             used_before_assignment |= b_used_before_assignment
+            definite = b_defined_symbols - branch_partial
+            must_defined = definite if must_defined is None else must_defined & definite
+        must_defined = must_defined or set()
+        partially_defined |= defined_syms - must_defined
+        partially_defined -= must_defined
 
         defined_syms -= used_before_assignment
         free_syms -= defined_syms
@@ -4195,3 +4286,16 @@ class FunctionCallRegion(NamedRegion):
                  debuginfo: Optional[dtypes.DebugInfo] = None):
         super().__init__(label, sdfg, debuginfo)
         self.arguments = arguments
+
+
+@functools.lru_cache(maxsize=None, typed=True)
+def last_condition_negates_the_others(conditions: tuple[str, ...]) -> bool:
+    """Whether the last of ``conditions`` is the negation of all earlier ones, the test ControlFlowRaising uses to emit
+    an else arm; a condition SymPy cannot parse makes the answer False."""
+    if len(conditions) < 2:
+        return False
+    try:
+        parsed = [symbolic.pystr_to_symbolic(condition) for condition in conditions]
+        return parsed[-1] == sympy.Not(sympy.Or(*parsed[:-1]))
+    except (TypeError, ValueError, SyntaxError):
+        return False

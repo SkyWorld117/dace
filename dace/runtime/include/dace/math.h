@@ -316,12 +316,12 @@ static DACE_CONSTEXPR DACE_HDFI T floor_mod(const T& numerator, const T& denomin
 // signed-shift behaviour C++ leaves implementation-defined.  (Fortran's
 // arithmetic right shift maps directly to ``arith.shrsi`` -> ``>>`` and
 // needs no helper.)  Templated so one call covers every integer kind.
-template<typename T>
-static DACE_CONSTEXPR DACE_HDFI T logical_left_shift(const T& x, const T& n) {
+template<typename T, typename TShift>
+static DACE_CONSTEXPR DACE_HDFI T logical_left_shift(const T& x, const TShift& n) {
     return (T)(((typename std::make_unsigned<T>::type)x) << n);
 }
-template<typename T>
-static DACE_CONSTEXPR DACE_HDFI T logical_right_shift(const T& x, const T& n) {
+template<typename T, typename TShift>
+static DACE_CONSTEXPR DACE_HDFI T logical_right_shift(const T& x, const TShift& n) {
     return (T)(((typename std::make_unsigned<T>::type)x) >> n);
 }
 

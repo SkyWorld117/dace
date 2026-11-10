@@ -1133,7 +1133,7 @@ def test_mapped_symbol_the_child_does_not_declare():
     for node in bodies:
         undeclared = node.symbol_mapping.keys() - node.sdfg.symbols.keys() - node.in_connectors.keys()
         assert not undeclared, f"{node.sdfg.name}: mapped without a declared type: {sorted(undeclared)}"
-    assert bodies[0].sdfg.symbols["k"] == dace.int32, "the carried-in symbol kept its type"
+    assert "k" not in bodies[0].symbol_mapping, "an unused parent mapping must not reach the lifted body"
 
     sdfg.validate()
     sdfg.compile()
@@ -1384,3 +1384,34 @@ def test_write_deduplication_does_not_format_symbolic_ranges(monkeypatch):
     output = np.zeros(10, dtype=np.int32)
     sdfg(A=output)
     np.testing.assert_array_equal(output, np.full(10, 2, dtype=np.int32))
+
+
+def test_a_symbol_the_body_assigns_in_a_branch_keeps_its_declared_type():
+    """``j = 1 if i == 0 else start; A[i] = j`` with ``j`` an ``int32`` symbol: the nested body declares ``j`` as the
+    parent did instead of inferring ``int64_t`` from the literal."""
+    sdfg = dace.SDFG("branch_assigned_symbol_type")
+    for name in ("start", "j"):
+        sdfg.add_symbol(name, dace.int32)
+    sdfg.add_array("A", [10], dace.float64)
+    loop = LoopRegion("loop", "i < 10", "i", "i = 0", "i = i + 1")
+    sdfg.add_node(loop, is_start_block=True)
+    pick = ConditionalBlock("pick")
+    loop.add_node(pick, is_start_block=True)
+    for condition, value in (("i == 0", "1"), (None, "start")):
+        branch = ControlFlowRegion(f"branch_{len(pick.branches)}")
+        branch.add_state_after(branch.add_state(is_start_block=True), assignments={"j": value})
+        pick.add_branch(None if condition is None else dace.properties.CodeBlock(condition), branch)
+    use = loop.add_state("use")
+    loop.add_edge(pick, use, dace.InterstateEdge())
+    tasklet = use.add_tasklet("store", {}, {"o"}, "o = j")
+    use.add_edge(tasklet, "o", use.add_write("A"), None, dace.Memlet("A[i]"))
+    sdfg.validate()
+
+    assert sdfg.apply_transformations(LoopToMap) == 1
+
+    nested = next(n for n, _ in sdfg.all_nodes_recursive() if isinstance(n, nodes.NestedSDFG))
+    assert nested.sdfg.symbols["j"] == dace.int32
+    assert "int64_t j;" not in "\n".join(obj.clean_code for obj in sdfg.generate_code())
+    A = np.zeros(10)
+    sdfg(A=A, start=7)
+    assert np.array_equal(A, np.array([1.0] + [7.0] * 9))

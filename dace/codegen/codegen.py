@@ -173,6 +173,11 @@ def generate_code(sdfg: SDFG, validate=True) -> List[CodeObject]:
     :param validate: If True, validates the SDFG before generating the code.
     :return: List of code objects that correspond to files to compile.
     """
+    with config.set_temporary("store_history", value=False):
+        return lower_and_generate_code(sdfg, validate)
+
+
+def lower_and_generate_code(sdfg: SDFG, validate: bool):
     from dace.codegen.target import TargetCodeGenerator  # Avoid import loop
 
     # Before compiling, validate SDFG correctness

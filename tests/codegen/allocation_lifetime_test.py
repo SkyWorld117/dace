@@ -7,7 +7,8 @@ import pytest
 import dace
 from dace.codegen.targets import framecode
 from dace.codegen.targets.cpu import _use_aligned_operator_new
-from dace.sdfg import infer_types
+from dace.sdfg import infer_types, utils
+from dace.sdfg.state import LoopRegion, ConditionalBlock, ControlFlowRegion
 import numpy as np
 
 
@@ -716,3 +717,34 @@ if __name__ == '__main__':
     test_view_read_without_an_access_node(True)
     test_view_read_without_an_access_node(False)
     test_multisize()
+
+
+def test_dominator_tree_matches_the_transitive_closure():
+    sdfg = dace.SDFG("dominator_tree")
+    first = sdfg.add_state("first", is_start_block=True)
+    loop = LoopRegion("loop", "i < 10", "i", "i = 0", "i = i + 1")
+    sdfg.add_node(loop)
+    body = loop.add_state("body", is_start_block=True)
+    branches = ConditionalBlock("branches")
+    loop.add_node(branches)
+    loop.add_edge(body, branches, dace.InterstateEdge())
+    for index, condition in enumerate(("i < 5", None)):
+        arm = ControlFlowRegion(f"arm{index}", sdfg=sdfg)
+        branches.add_branch(dace.properties.CodeBlock(condition) if condition else None, arm)
+        arm.add_edge(arm.add_state(f"a{index}", is_start_block=True), arm.add_state(f"b{index}"), dace.InterstateEdge())
+    left, right, last = sdfg.add_state("left"), sdfg.add_state("right"), sdfg.add_state("last")
+    sdfg.add_edge(first, loop, dace.InterstateEdge())
+    sdfg.add_edge(loop, left, dace.InterstateEdge("N > 0"))
+    sdfg.add_edge(loop, right, dace.InterstateEdge("N <= 0"))
+    sdfg.add_edge(left, last, dace.InterstateEdge())
+    sdfg.add_edge(right, last, dace.InterstateEdge())
+
+    idom, alldom, ipostdom, allpostdom = {}, {}, {}, {}
+    utils.get_control_flow_block_dominators(sdfg, idom, alldom, ipostdom, allpostdom)
+    dom, postdom = framecode.dominator_trees(sdfg)
+    for tree, closure in ((dom, alldom), (postdom, allpostdom)):
+        blocks = list(closure)
+        for a in blocks:
+            for b in blocks:
+                assert tree.dominates(a, b) == (a is b or a in closure[b]), (a, b)
+    assert dom.dominates(first, last) and postdom.dominates(last, first) and not dom.dominates(left, last)
