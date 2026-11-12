@@ -1429,6 +1429,21 @@ class SDFG(ControlFlowRegion):
         return self.name
 
     @property
+    def constant_names(self) -> Set[str]:
+        """Names of local and inherited constants, without casting their values.
+
+        This reflects edits to constants_prop and parent scopes immediately;
+        graph analyses that only need membership should use it instead of
+        materializing the typed constants dictionary.
+        """
+        result = set()
+        ancestor = self
+        while ancestor is not None:
+            result.update(ancestor.constants_prop)
+            ancestor = ancestor.parent_sdfg
+        return result
+
+    @property
     def constants(self):
         """ A dictionary of compile-time constants defined in this SDFG. """
         result = {}

@@ -744,7 +744,7 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
             freesyms |= e.data.used_symbols(all_symbols, e)
 
         # Do not consider SDFG constants as symbols
-        new_symbols.update(set(sdfg.constants.keys()))
+        new_symbols.update(sdfg.constant_names)
         return freesyms - new_symbols
 
     def defined_symbols(self) -> Dict[str, dt.Data]:
@@ -1011,10 +1011,11 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
 
         # Add scalar arguments from free symbols
         defined_syms = defined_syms or self.defined_symbols()
+        constant_names = sdfg.constant_names
         scalar_args.update({
             k: dt.Scalar(defined_syms[k]) if k in defined_syms else sdfg.arrays[k]
             for k in self.used_symbols(all_symbols=False)
-            if not k.startswith('__dace') and k not in sdfg.constants and (k in defined_syms or k in sdfg.arrays)
+            if not k.startswith('__dace') and k not in constant_names and (k in defined_syms or k in sdfg.arrays)
         })
 
         # Add scalar arguments from free symbols of data descriptors
@@ -1022,7 +1023,7 @@ class DataflowGraphView(BlockGraphView, abc.ABC):
             scalar_args.update({
                 str(k): dt.Scalar(k.dtype)
                 for k in arg.used_symbols(all_symbols=False)
-                if not str(k).startswith('__dace') and str(k) not in sdfg.constants
+                if not str(k).startswith('__dace') and str(k) not in constant_names
             })
 
         return data_args, scalar_args
