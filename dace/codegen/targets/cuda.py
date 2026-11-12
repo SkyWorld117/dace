@@ -770,12 +770,16 @@ void __dace_gpu_set_all_streams({sdfg_state_name} *__state, gpuStream_t stream)
                                                                        ptr=dataname,
                                                                        elements=sym2cpp(arrsize)))
         elif nodedesc.storage == dtypes.StorageType.Register:
-            if is_dynamically_sized:
-                raise ValueError('Dynamic allocation of registers not allowed')
             if nodedesc.start_offset != 0:
                 raise NotImplementedError('Start offset unsupported for registers')
-            szstr = ' = {0}' if node.setzero else ''
-            result_decl.write("%s %s[%s]%s;\n" % (nodedesc.dtype.ctype, dataname, sym2cpp(arrsize), szstr))
+            if is_dynamically_sized:
+                result_decl.write(f"{ctypedef} {dataname} = static_cast<{ctypedef}>("
+                                  f"alloca({arrsize_malloc}));\n")
+                if node.setzero:
+                    result_alloc.write(f"memset({dataname}, 0, {arrsize_malloc});\n")
+            else:
+                szstr = ' = {0}' if node.setzero else ''
+                result_decl.write("%s %s[%s]%s;\n" % (nodedesc.dtype.ctype, dataname, sym2cpp(arrsize), szstr))
             self._dispatcher.defined_vars.add(dataname, DefinedType.Pointer, ctypedef)
         else:
             raise NotImplementedError("CUDA: Unimplemented storage type " + str(nodedesc.storage))

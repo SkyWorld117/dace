@@ -589,12 +589,20 @@ class CPUCodeGen(TargetCodeGenerator):
                 )
                 define_var(name, DefinedType.Pointer, ctypedef)
                 return
-            declaration_stream.write(
-                "%s %s[%s]%s;\n" % (nodedesc.dtype.ctype, name, cpp.sym2cpp(arrsize), alignment),
-                cfg,
-                state_id,
-                node,
-            )
+            if variable_length_array:
+                # CUDA accepts runtime-sized thread stacks via alloca, but not C++ VLAs.
+                # Keep this at the allocation site: a helper would return its dead frame.
+                declaration_stream.write(
+                    f"#if defined(__CUDACC__)\n"
+                    f"{nodedesc.dtype.ctype} *{name} = static_cast<{nodedesc.dtype.ctype} *>("
+                    f"alloca(sizeof({nodedesc.dtype.ctype}) * ({cpp.sym2cpp(arrsize)})));\n"
+                    f"#else\n{nodedesc.dtype.ctype} {name}[{cpp.sym2cpp(arrsize)}];\n#endif\n",
+                    cfg, state_id, node)
+            else:
+                declaration_stream.write(
+                    "%s %s[%s]%s;\n" % (nodedesc.dtype.ctype, name, cpp.sym2cpp(arrsize), alignment),
+                    cfg, state_id, node)
+
             if node.setzero:
                 allocation_stream.write(
                     "memset(%s, 0, sizeof(%s)*(%s));\n" % (name, nodedesc.dtype.ctype, cpp.sym2cpp(arrsize)), cfg,
