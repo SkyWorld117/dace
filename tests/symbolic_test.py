@@ -31,7 +31,8 @@ def test_numeric_evaluation_does_not_inspect_unrelated_constants():
         def items(self):
             raise AssertionError('numeric expression substituted unrelated values')
 
-    values = [2, 0.25, np.float32(0.25), sp.Integer(2), sp.Float(0.25)]
+    values = [2, 0.25, np.float32(0.25), sp.Integer(2), sp.Float(0.25),
+              sp.pi, sp.Function('float32')(sp.Rational(1, 3))]
     for value in values:
         result = evaluate(value, UnrelatedConstants(unused=9))
         assert result == value

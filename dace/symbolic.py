@@ -735,6 +735,8 @@ def evaluate(expr: Union[sympy.Basic, int, float], symbols: Dict[Union[symbol, s
         return expr.cast_value()
     if isinstance(expr, (int, float, numpy.number, sympy.Number)):
         return expr
+    if isinstance(expr, sympy.Basic) and not expr.atoms(sympy.Symbol):
+        return expr
     if issymbolic(expr, set(map(str, symbols.keys()))):
         # Check for UndefinedSymbol
         for atom in expr.atoms():
