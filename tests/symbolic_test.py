@@ -17,3 +17,22 @@ def test_simplify_ext_min() -> None:
 
 if __name__ == "__main__":
     test_simplify_ext_min()
+
+
+def test_numeric_evaluation_does_not_inspect_unrelated_constants():
+    import numpy as np
+    import sympy as sp
+    from dace.symbolic import evaluate
+
+    class UnrelatedConstants(dict):
+        def keys(self):
+            raise AssertionError('numeric expression inspected unrelated names')
+
+        def items(self):
+            raise AssertionError('numeric expression substituted unrelated values')
+
+    values = [2, 0.25, np.float32(0.25), sp.Integer(2), sp.Float(0.25)]
+    for value in values:
+        result = evaluate(value, UnrelatedConstants(unused=9))
+        assert result == value
+        assert type(result) is type(value)

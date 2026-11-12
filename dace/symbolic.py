@@ -728,16 +728,19 @@ def evaluate(expr: Union[sympy.Basic, int, float], symbols: Dict[Union[symbol, s
         return tuple(evaluate(e, symbols) for e in expr)
     if isinstance(expr, SymExpr):
         return evaluate(expr.expr, symbols)
+    # Literal values cannot be affected by substitutions. In particular, a
+    # SymPy numeric power exponent must not sort/substitute a large constant
+    # table every time a tasklet expression is emitted.
+    if isinstance(expr, TypedConstant):
+        return expr.cast_value()
+    if isinstance(expr, (int, float, numpy.number, sympy.Number)):
+        return expr
     if issymbolic(expr, set(map(str, symbols.keys()))):
         # Check for UndefinedSymbol
         for atom in expr.atoms():
             if isinstance(atom, UndefinedSymbol):
                 raise TypeError(f'Cannot evaluate expression "{expr}" containing undefined symbol')
         raise TypeError(f'Symbolic expression "{expr}" cannot be evaluated to a constant')
-    if isinstance(expr, (int, float, numpy.number)):
-        return expr
-    if isinstance(expr, TypedConstant):
-        return expr.cast_value()
 
     # Evaluate all symbols
     syms = {(sname if isinstance(sname, sympy.Symbol) else symbol(sname)): sval for sname, sval in symbols.items()}
