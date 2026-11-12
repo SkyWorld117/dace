@@ -493,6 +493,15 @@ class InlineSDFG(transformation.SingleStateTransformation):
                         if ndesc.shape != outer_desc.shape or ndesc.strides != outer_desc.strides:
                             reshapes.add(root.dst.data)
 
+        # Only names are needed for collision checks. Reading sdfg.constants
+        # materializes and casts every value (including inherited constants)
+        # on each membership test, making large nested graphs quadratic.
+        constant_names = set()
+        ancestor = sdfg
+        while ancestor is not None:
+            constant_names.update(ancestor.constants_prop)
+            ancestor = ancestor.parent_sdfg
+
         # All transients become transients of the parent (if data already
         # exists, find new name)
         # Mapping from nested transient name to top-level name
@@ -502,7 +511,7 @@ class InlineSDFG(transformation.SingleStateTransformation):
                 datadesc = nsdfg.arrays[node.data]
                 if node.data not in transients and datadesc.transient:
                     new_name = node.data
-                    if (new_name in sdfg.arrays or new_name in sdfg.symbols or new_name in sdfg.constants):
+                    if (new_name in sdfg.arrays or new_name in sdfg.symbols or new_name in constant_names):
                         new_name = f'{nsdfg.label}_{node.data}'
 
                     name = sdfg.add_datadesc(new_name, datadesc, find_new_name=True)
@@ -515,7 +524,7 @@ class InlineSDFG(transformation.SingleStateTransformation):
                     datadesc = nsdfg.arrays[edge.data.data]
                     if edge.data.data not in transients and datadesc.transient:
                         new_name = edge.data.data
-                        if (new_name in sdfg.arrays or new_name in sdfg.symbols or new_name in sdfg.constants):
+                        if (new_name in sdfg.arrays or new_name in sdfg.symbols or new_name in constant_names):
                             new_name = f'{nsdfg.label}_{edge.data.data}'
 
                         name = sdfg.add_datadesc(new_name, datadesc, find_new_name=True)
@@ -543,16 +552,37 @@ class InlineSDFG(transformation.SingleStateTransformation):
                     pass
 
         # All constants (and associated transients) become constants of the parent
+        constant_replacements = {}
         for cstname, (csttype, cstval) in nsdfg.constants_prop.items():
-            if cstname in sdfg.constants:
+            if cstname in constant_names:
                 if cstname in transients:
                     newname = transients[cstname]
                 else:
                     newname = sdfg.find_new_constant(cstname)
                     transients[cstname] = newname
                 sdfg.constants_prop[newname] = (csttype, cstval)
+                constant_names.add(newname)
+                if cstname != newname:
+                    constant_replacements[cstname] = newname
             else:
                 sdfg.constants_prop[cstname] = (csttype, cstval)
+                constant_names.add(cstname)
+
+        # Constants can occur directly in tasklet code, map ranges and subsets,
+        # not only as AccessNode names. Preserve the child's value when a
+        # different parent constant has the same name.
+        if constant_replacements:
+            from dace.sdfg.replace import replace_properties_dict
+            const_syms = {symbolic.pystr_to_symbolic(k): symbolic.pystr_to_symbolic(v)
+                          for k, v in constant_replacements.items()}
+            for node in nstate.nodes():
+                if not isinstance(node, nodes.AccessNode):
+                    replace_properties_dict(node, constant_replacements, const_syms, nsdfg)
+            for edge in nstate.edges():
+                replace_properties_dict(edge.data, constant_replacements, const_syms, nsdfg)
+            for name in set(transients.values()):
+                if name in sdfg.arrays:
+                    replace_properties_dict(sdfg.arrays[name], constant_replacements, const_syms, nsdfg)
 
         #######################################################
         # Replace data on inlined SDFG nodes/edges
