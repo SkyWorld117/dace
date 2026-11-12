@@ -41,12 +41,37 @@ def _fortran_dim_to_axis(dim, mask_rank):
 def _descriptors(node, parent_sdfg, parent_state):
     """``(mask_desc, out_desc, mask_shape, axis)`` rebuilt from the wired edges, for the inner ``@dace.program``."""
     mask, mask_subset, out, out_subset = _validate_edges(node, parent_sdfg, parent_state)
-    mask_shape = [(e + 1 - b) // s for (b, e, s) in mask_subset]
-    out_shape = [(e + 1 - b) // s for (b, e, s) in out_subset] if out_subset.dims() else [1]
+    mask_shape = list(mask_subset.size())
+    out_shape = list(out_subset.size()) if out_subset.dims() else [1]
     axis = _fortran_dim_to_axis(node.dim, len(mask_shape))
-    mask_desc = dace.data.Array(mask.dtype, mask_shape, storage=mask.storage)
+    mask_strides = [stride * subset[2] for stride, subset in zip(mask.strides, mask_subset)]
+    mask_desc = dace.data.Array(mask.dtype, mask_shape, strides=mask_strides, storage=mask.storage)
+    # The frontend's reduction result is contiguous; publish into the caller's
+    # possibly strided storage explicitly below.
     out_desc = dace.data.Array(dace.bool_, out_shape, storage=out.storage)
     return mask_desc, out_desc, mask_shape, axis
+
+
+def _convert_logical_output(graph, node, parent_state, parent_sdfg):
+    """Convert Boolean results by value to the caller's Fortran logical storage."""
+    _, _, target, subset = _validate_edges(node, parent_sdfg, parent_state)
+    target_strides = [stride * part[2] for stride, part in zip(target.strides, subset)] or [1]
+    if target.dtype == dace.bool_ and tuple(target_strides) == tuple(graph.arrays["_out"].strides):
+        return graph
+    graph.replace("_out", "__logical_result")
+    result = graph.arrays["__logical_result"]
+    result.transient = True
+    graph.add_array("_out", result.shape, target.dtype, strides=target_strides, storage=result.storage)
+    sinks = list(graph.sink_nodes())
+    convert = graph.add_state("convert_logical_kind")
+    for sink in sinks:
+        graph.add_edge(sink, convert, dace.InterstateEdge())
+    indices = [f"__logical_i{dim}" for dim in range(len(result.shape))]
+    subset = ",".join(indices)
+    convert.add_mapped_tasklet("logical_kind", {index: f"0:{size}" for index, size in zip(indices, result.shape)},
+                              {"value": dace.Memlet(f"__logical_result[{subset}]")}, "converted = value",
+                              {"converted": dace.Memlet(f"_out[{subset}]")}, external_edges=True)
+    return graph
 
 
 def _reduction_sdfg(node, parent_state, parent_sdfg, is_all):
@@ -81,7 +106,8 @@ def _reduction_sdfg(node, parent_state, parent_sdfg, is_all):
             def kernel(_mask, _out):
                 _out[:] = dace.reduce(lambda a, b: a or b, _mask != 0, axis=axis, identity=ident)
 
-    return kernel.to_sdfg(_mask=mask_desc, _out=out_desc, simplify=True)
+    graph = kernel.to_sdfg(_mask=mask_desc, _out=out_desc, simplify=True)
+    return _convert_logical_output(graph, node, parent_state, parent_sdfg)
 
 
 def _sequential_sdfg(node, parent_state, parent_sdfg, is_all):
@@ -111,7 +137,8 @@ def _sequential_sdfg(node, parent_state, parent_sdfg, is_all):
                     _out[0] = 1
                     break
 
-    return kernel.to_sdfg(_mask=mask_desc, _out=out_desc, simplify=True)
+    graph = kernel.to_sdfg(_mask=mask_desc, _out=out_desc, simplify=True)
+    return _convert_logical_output(graph, node, parent_state, parent_sdfg)
 
 
 @library.expansion

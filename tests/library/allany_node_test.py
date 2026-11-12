@@ -218,3 +218,21 @@ def test_sequential_dimwise_falls_back():
     sdfg = _build_allany_sdfg("seq_dim", "all", [3, 4], dace.int32, 1, [4], dace.int32, implementation="sequential")
     with pytest.raises(NotImplementedError, match="rank-1 whole-array"):
         sdfg.expand_library_nodes()
+
+
+@pytest.mark.parametrize('op', ['all', 'any'])
+def test_fortran_logical_kind_and_column_major_mask_into_strided_output(op):
+    sdfg = dace.SDFG('fortran_logical_kind_' + op)
+    sdfg.add_array('mask', [2, 3], dace.int32, strides=[1, 2])
+    sdfg.add_array('out', [6], dace.uint32)
+    state = sdfg.add_state()
+    node = (AllNode if op == 'all' else AnyNode)('logical', dim=2)
+    state.add_node(node)
+    state.add_edge(state.add_read('mask'), None, node, '_mask', dace.Memlet('mask[0:2,0:3]'))
+    state.add_edge(node, '_out', state.add_write('out'), None, dace.Memlet('out[1:5:2]'))
+    mask = np.array([[1, 1, 1], [0, 0, 0]], dtype=np.int32, order='F')
+    out = np.full(6, 99, dtype=np.uint32)
+    sdfg(mask=mask, out=out)
+    expected = np.full(6, 99, dtype=np.uint32)
+    expected[[1, 3]] = [1, 0]
+    np.testing.assert_array_equal(out, expected)
