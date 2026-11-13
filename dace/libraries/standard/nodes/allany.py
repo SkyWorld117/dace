@@ -63,15 +63,16 @@ def _convert_logical_output(graph, node, parent_state, parent_sdfg):
     result = graph.arrays["__logical_result"]
     result.transient = True
     graph.add_array("_out", result.shape, target.dtype, strides=target_strides, storage=target.storage)
-    # A CPU mask may feed a device-resident logical result. Compute/cast on
-    # the mask's side, then use an explicit copy instead of dereferencing a
-    # device pointer in a host tasklet.
-    separate_storage = (result.storage not in (dace.StorageType.GPU_Global, dace.StorageType.GPU_Shared)
-                        and target.storage == dace.StorageType.GPU_Global)
-    converted_name = "__logical_host_result" if separate_storage else "_out"
+    # Convert on the mask's side, then explicitly copy between host and
+    # device storage. Tasklets cannot directly write across that boundary.
+    device_storages = (dace.StorageType.GPU_Global, dace.StorageType.GPU_Shared)
+    host_to_device = result.storage not in device_storages and target.storage == dace.StorageType.GPU_Global
+    device_to_host = result.storage == dace.StorageType.GPU_Global and target.storage not in device_storages
+    separate_storage = host_to_device or device_to_host
+    converted_name = "__logical_host_result" if host_to_device else "__logical_device_result" if device_to_host else "_out"
     if separate_storage:
-        graph.add_array(converted_name, result.shape, target.dtype,
-                        storage=dace.StorageType.CPU_Heap, transient=True)
+        storage = dace.StorageType.CPU_Heap if host_to_device else dace.StorageType.GPU_Global
+        graph.add_array(converted_name, result.shape, target.dtype, storage=storage, transient=True)
     sinks = list(graph.sink_nodes())
     convert = graph.add_state("convert_logical_kind")
     for sink in sinks:
@@ -82,7 +83,7 @@ def _convert_logical_output(graph, node, parent_state, parent_sdfg):
                               {"value": dace.Memlet(f"__logical_result[{subset}]")}, "converted = value",
                               {"converted": dace.Memlet(f"{converted_name}[{subset}]")}, external_edges=True)
     if separate_storage:
-        publish = graph.add_state_after(convert, "publish_device_logical")
+        publish = graph.add_state_after(convert, "publish_logical_result")
         publish.add_edge(publish.add_read(converted_name), None, publish.add_write("_out"), None,
                          dace.Memlet.from_array(converted_name, graph.arrays[converted_name]))
     return graph

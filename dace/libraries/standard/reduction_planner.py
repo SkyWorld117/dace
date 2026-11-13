@@ -248,10 +248,10 @@ def get_reduction_schedule(in_array: Array,
         if schedule.grid == []:
             schedule.grid = [1]
 
-        # 32 threads per block unless contiguous dimension too small
-        threads_per_block = shape[contiguous_dimension] if (shape[contiguous_dimension]
-                                                            < warp_size) == True else warp_size
-        schedule.block = [threads_per_block]
+        # The generated shuffle reduction uses a full warp mask. Lanes with
+        # no input retain the identity, so short reductions still need a full
+        # warp of participating threads.
+        schedule.block = [warp_size]
 
         stride = warp_size * num_loaded_elements if schedule.vectorize else warp_size
         # 1 thread block sums up the shape[contiguous_dimension] elements with a stride

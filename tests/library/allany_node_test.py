@@ -260,3 +260,26 @@ def test_host_mask_can_publish_logical_result_to_device_storage(op):
     out = np.full(6, 99, dtype=np.uint32)
     sdfg(mask=mask, out=out)
     np.testing.assert_array_equal(out, [99, 1, 99, 0, 99, 99])
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("op", ["all", "any"])
+def test_device_mask_can_publish_logical_result_to_host_storage(op):
+    sdfg = dace.SDFG("device_mask_host_logical_" + op)
+    sdfg.add_array("mask", [2, 3], dace.int32, strides=[1, 2])
+    sdfg.add_array("out", [2], dace.uint32)
+    sdfg.add_array("device_mask", [2, 3], dace.int32, strides=[1, 2],
+                   storage=dace.StorageType.GPU_Global, transient=True)
+    seed = sdfg.add_state("seed")
+    seed.add_edge(seed.add_read("mask"), None, seed.add_write("device_mask"), None,
+                  dace.Memlet("mask[0:2,0:3]"))
+    state = sdfg.add_state_after(seed, "reduce")
+    node = (AllNode if op == "all" else AnyNode)("logical", dim=2)
+    node.schedule = dace.ScheduleType.GPU_Device
+    state.add_node(node)
+    state.add_edge(state.add_read("device_mask"), None, node, "_mask", dace.Memlet("device_mask[0:2,0:3]"))
+    state.add_edge(node, "_out", state.add_write("out"), None, dace.Memlet("out[0:2]"))
+    mask = np.array([[1, 1, 1], [0, 0, 0]], dtype=np.int32, order="F")
+    out = np.full(2, 99, dtype=np.uint32)
+    sdfg(mask=mask, out=out)
+    np.testing.assert_array_equal(out, [1, 0])
