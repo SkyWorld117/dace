@@ -48,7 +48,7 @@ def _descriptors(node, parent_sdfg, parent_state):
     mask_desc = dace.data.Array(mask.dtype, mask_shape, strides=mask_strides, storage=mask.storage)
     # The frontend's reduction result is contiguous; publish into the caller's
     # possibly strided storage explicitly below.
-    out_desc = dace.data.Array(dace.bool_, out_shape, storage=out.storage)
+    out_desc = dace.data.Array(dace.bool_, out_shape, storage=mask.storage)
     return mask_desc, out_desc, mask_shape, axis
 
 
@@ -56,12 +56,22 @@ def _convert_logical_output(graph, node, parent_state, parent_sdfg):
     """Convert Boolean results by value to the caller's Fortran logical storage."""
     _, _, target, subset = _validate_edges(node, parent_sdfg, parent_state)
     target_strides = [stride * part[2] for stride, part in zip(target.strides, subset)] or [1]
-    if target.dtype == dace.bool_ and tuple(target_strides) == tuple(graph.arrays["_out"].strides):
+    if (target.dtype == dace.bool_ and target.storage == graph.arrays["_out"].storage
+            and tuple(target_strides) == tuple(graph.arrays["_out"].strides)):
         return graph
     graph.replace("_out", "__logical_result")
     result = graph.arrays["__logical_result"]
     result.transient = True
-    graph.add_array("_out", result.shape, target.dtype, strides=target_strides, storage=result.storage)
+    graph.add_array("_out", result.shape, target.dtype, strides=target_strides, storage=target.storage)
+    # A CPU mask may feed a device-resident logical result. Compute/cast on
+    # the mask's side, then use an explicit copy instead of dereferencing a
+    # device pointer in a host tasklet.
+    separate_storage = (result.storage not in (dace.StorageType.GPU_Global, dace.StorageType.GPU_Shared)
+                        and target.storage == dace.StorageType.GPU_Global)
+    converted_name = "__logical_host_result" if separate_storage else "_out"
+    if separate_storage:
+        graph.add_array(converted_name, result.shape, target.dtype,
+                        storage=dace.StorageType.CPU_Heap, transient=True)
     sinks = list(graph.sink_nodes())
     convert = graph.add_state("convert_logical_kind")
     for sink in sinks:
@@ -70,7 +80,11 @@ def _convert_logical_output(graph, node, parent_state, parent_sdfg):
     subset = ",".join(indices)
     convert.add_mapped_tasklet("logical_kind", {index: f"0:{size}" for index, size in zip(indices, result.shape)},
                               {"value": dace.Memlet(f"__logical_result[{subset}]")}, "converted = value",
-                              {"converted": dace.Memlet(f"_out[{subset}]")}, external_edges=True)
+                              {"converted": dace.Memlet(f"{converted_name}[{subset}]")}, external_edges=True)
+    if separate_storage:
+        publish = graph.add_state_after(convert, "publish_device_logical")
+        publish.add_edge(publish.add_read(converted_name), None, publish.add_write("_out"), None,
+                         dace.Memlet.from_array(converted_name, graph.arrays[converted_name]))
     return graph
 
 
