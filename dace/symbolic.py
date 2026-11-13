@@ -1790,6 +1790,14 @@ class PythonOpToSympyConverter(ast.NodeTransformer):
         # comparisons (`A[i] < rlmin`, `x == 1`) are untouched.
         if isinstance(op, (ast.Eq, ast.NotEq)):
             for literal, other in ((node.left, node.comparators[0]), (node.comparators[0], node.left)):
+                # Scalar propagation can replace a flag in ``flag != 0`` with
+                # a Boolean expression. SymPy considers Boolean != Integer(0)
+                # unconditionally true, so normalize literal 0/1 first.
+                boolean_expression = (isinstance(other, (ast.Compare, ast.BoolOp))
+                                      or isinstance(other, ast.UnaryOp) and isinstance(other.op, ast.Not))
+                if (boolean_expression and isinstance(literal, ast.Constant)
+                        and isinstance(literal.value, (int, float)) and literal.value in (0, 1)):
+                    literal.value = bool(literal.value)
                 if isinstance(literal, ast.Constant) and isinstance(literal.value, bool):
                     visited = self.visit(other)
                     if isinstance(op, ast.NotEq) == bool(literal.value):  # X != True or X == False
