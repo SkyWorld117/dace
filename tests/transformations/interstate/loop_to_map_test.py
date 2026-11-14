@@ -1415,3 +1415,63 @@ def test_a_symbol_the_body_assigns_in_a_branch_keeps_its_declared_type():
     A = np.zeros(10)
     sdfg(A=A, start=7)
     assert np.array_equal(A, np.array([1.0] + [7.0] * 9))
+
+
+def _column_loop_with_inner_maps(cross_column_read=False):
+    sdfg = dace.SDFG("column_maps_carried" if cross_column_read else "column_maps_branch")
+    sdfg.add_array("A", [5, 6], dace.float64, strides=[1, 5])
+    if not cross_column_read:
+        sdfg.add_array("B", [5, 6], dace.float64, strides=[1, 5])
+    for name in ("i", "k_2", "k_3"):
+        sdfg.add_symbol(name, dace.int32)
+    outer = LoopRegion("columns", "i < 4", "i", "i = 0", "i = i + 1")
+    sdfg.add_node(outer, is_start_block=True)
+    inners = []
+    if cross_column_read:
+        branches = [(outer, 2)]
+    else:
+        choose = ConditionalBlock("choose")
+        outer.add_node(choose, is_start_block=True)
+        branches = []
+        for condition, value in (("i % 2 == 0", 2), (None, 3)):
+            branch = ControlFlowRegion(f"branch_{value}", sdfg=sdfg)
+            choose.add_branch(None if condition is None else dace.properties.CodeBlock(condition), branch)
+            branches.append((branch, value))
+    for region, value in branches:
+        level = f"k_{value}"
+        inner = LoopRegion(f"levels_{value}", f"{level} < 6", level, f"{level} = 0", f"{level} = {level} + 1")
+        region.add_node(inner, is_start_block=True)
+        body = inner.add_state("body", is_start_block=True)
+        task = body.add_tasklet("scale", {"inp"}, {"out"}, f"out = {value} * inp")
+        source = f"A[i+1,{level}]" if cross_column_read else f"A[i,{level}]"
+        target = "A" if cross_column_read else "B"
+        body.add_edge(body.add_read("A"), None, task, "inp", dace.Memlet(source))
+        body.add_edge(task, "out", body.add_write(target), None, dace.Memlet(f"{target}[i,{level}]"))
+        inners.append(inner)
+    for inner in inners:
+        LoopToMap.apply_to(sdfg, loop=inner)
+    return sdfg, outer
+
+
+def test_inner_maps_in_control_flow_keep_column_write_bounds():
+    sdfg, outer = _column_loop_with_inner_maps()
+    assert LoopToMap.can_be_applied_to(sdfg, loop=outer)
+    LoopToMap.apply_to(sdfg, loop=outer)
+    sdfg.validate()
+    source = np.array(np.arange(30).reshape(5, 6), dtype=np.float64, order="F")
+    output = np.full((5, 6), 99., order="F")
+    sdfg(A=source, B=output)
+    expected = np.full((5, 6), 99., order="F")
+    expected[:4] = source[:4] * np.array([2, 3, 2, 3])[:, None]
+    np.testing.assert_array_equal(output, expected)
+
+
+def test_inner_map_propagation_does_not_hide_cross_column_reads():
+    sdfg, outer = _column_loop_with_inner_maps(cross_column_read=True)
+    assert not LoopToMap.can_be_applied_to(sdfg, loop=outer)
+    sdfg.validate()
+    values = np.array(np.arange(30).reshape(5, 6), dtype=np.float64, order="F")
+    expected = values.copy(order="F")
+    expected[:4] = values[1:] * 2
+    sdfg(A=values)
+    np.testing.assert_array_equal(values, expected)

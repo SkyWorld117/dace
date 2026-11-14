@@ -1372,9 +1372,9 @@ def propagate_memlets_nested_sdfg(parent_sdfg: 'SDFG', parent_state: 'SDFGState'
 def reset_state_annotations(sdfg: 'SDFG'):
     """ Resets the state (loop-related) annotations of an SDFG.
 
-        :note: This operation is shallow (does not go into nested SDFGs).
+        :note: This covers child control-flow regions; nested SDFGs are reset separately.
     """
-    for state in sdfg.states():
+    for state in sdfg.all_states():
         state.executions = 0
         state.dynamic_executions = True
         state.ranges = {}
@@ -1388,7 +1388,7 @@ def propagate_memlets_sdfg(sdfg: 'SDFG'):
     # Reset previous annotations first
     reset_state_annotations(sdfg)
 
-    for state in sdfg.states():
+    for state in sdfg.all_states():
         propagate_memlets_state(sdfg, state)
 
     propagate_states(sdfg)
