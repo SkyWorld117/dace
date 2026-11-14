@@ -117,8 +117,8 @@ def _emit_pure(node, parent_state: SDFGState, parent_sdfg: SDFG, func: str):
             external_edges=True,
         )
     else:
-        rng = {f"__o{d}": f"0:{shape[d]}" for d in range(rank) if d != dim_zero}
-        out_subs = ", ".join([f"__o{d}" for d in range(rank) if d != dim_zero])
+        rng = {f"__o{d}": f"0:{shape[d]}" for d in range(rank) if d != dim_zero} or {"__t": "0:1"}
+        out_subs = ", ".join([f"__o{d}" for d in range(rank) if d != dim_zero]) or "0"
         init_val.add_mapped_tasklet(
             name="init_best_val",
             map_ranges=rng,
@@ -132,7 +132,7 @@ def _emit_pure(node, parent_state: SDFGState, parent_sdfg: SDFG, func: str):
     reduce_val = sdfg.add_state_after(init_val, node.label + "_reduce_val")
     map_rng = {f"__i{d}": f"0:{shape[d]}" for d in range(rank)}
     x_subs = ", ".join([f"__i{d}" for d in range(rank)])
-    bv_subs = "0" if flat else ", ".join([f"__i{d}" for d in range(rank) if d != dim_zero])
+    bv_subs = ("0" if flat else ", ".join([f"__i{d}" for d in range(rank) if d != dim_zero])) or "0"
     reduce_val.add_mapped_tasklet(
         name="reduce_best_val",
         map_ranges=map_rng,
@@ -154,8 +154,8 @@ def _emit_pure(node, parent_state: SDFGState, parent_sdfg: SDFG, func: str):
             external_edges=True,
         )
     else:
-        rng = {f"__o{d}": f"0:{shape[d]}" for d in range(rank) if d != dim_zero}
-        out_subs = ", ".join([f"__o{d}" for d in range(rank) if d != dim_zero])
+        rng = {f"__o{d}": f"0:{shape[d]}" for d in range(rank) if d != dim_zero} or {"__t": "0:1"}
+        out_subs = ", ".join([f"__o{d}" for d in range(rank) if d != dim_zero]) or "0"
         init_idx.add_mapped_tasklet(
             name="init_best_idx",
             map_ranges=rng,
@@ -207,8 +207,8 @@ def _emit_pure(node, parent_state: SDFGState, parent_sdfg: SDFG, func: str):
                 external_edges=True,
             )
     else:
-        rng = {f"__o{d}": f"0:{shape[d]}" for d in range(rank) if d != dim_zero}
-        out_subs = ", ".join([f"__o{d}" for d in range(rank) if d != dim_zero])
+        rng = {f"__o{d}": f"0:{shape[d]}" for d in range(rank) if d != dim_zero} or {"__t": "0:1"}
+        out_subs = ", ".join([f"__o{d}" for d in range(rank) if d != dim_zero]) or "0"
         extract.add_mapped_tasklet(
             name="extract_idx",
             map_ranges=rng,
