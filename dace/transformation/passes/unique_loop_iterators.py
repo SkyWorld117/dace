@@ -19,10 +19,9 @@ from typing import Optional, Set, Union
 
 import dace
 from dace.sdfg.replace import replace_properties_dict
-from dace.sdfg.state import ControlFlowRegion, LoopRegion
+from dace.sdfg.state import AbstractControlFlowRegion, ControlFlowRegion, LoopRegion
 from dace.transformation import pass_pipeline as ppl
 from dace.transformation.passes.analysis import loop_analysis
-from dace.transformation.passes.analysis import ControlFlowBlockReachability
 from dace.transformation.transformation import explicit_cf_compatible
 
 # Prefix for renamed iterators; self-identifying in codegen / dumped SDFGs.
@@ -163,7 +162,7 @@ class UniqueLoopIterators(ppl.Pass):
                     readers.setdefault(sym, set()).add(edge.dst)
         return readers
 
-    def _post_value_needed(self, loop: LoopRegion, old_name: str, block_reach: dict, blocks_reading: dict) -> bool:
+    def _post_value_needed(self, loop: LoopRegion, old_name: str, blocks_reading: dict) -> bool:
         """Decide whether the iterator-after-loop assignment for
         ``old_name`` should be materialised after ``loop``.
 
@@ -204,15 +203,44 @@ class UniqueLoopIterators(ppl.Pass):
             own.update(cfr.nodes())
         if readers.issubset(own):
             return True
-        reach = block_reach.get(loop.parent_graph.cfg_id, {}).get(loop)
-        if not reach:
-            return True  # reachability unknown -> cannot prove skippable -> emit (extended default)
-        if not readers.isdisjoint(reach):
-            return True  # a reader is reachable AFTER the loop -> the genuine after-loop read
-        # Readers exist, none inside the loop, none downstream of it: an external
-        # free-symbol PARAMETER an inlining collapse left sharing the mangled name --
-        # emitting the assignment would shadow it (a hard C++ compile error). Skip.
-        return False
+        reached_any = False
+        for reached in self._blocks_after(loop):
+            reached_any = True
+            if reached in readers:
+                return True
+        # Preserve the conservative default when reachability is empty/unknown.
+        return not reached_any
+
+    @staticmethod
+    def _blocks_after(loop: LoopRegion):
+        """Yield the same conservative successors as block reachability, on demand.
+
+        Only loop-to-reader queries are needed here. Materializing the transitive
+        closure for every state consumes quadratic memory in large Fortran leaves.
+        Regions reached later contribute all their blocks; enclosing loops may
+        revisit any of their blocks. Conditional siblings are not successors.
+        Nested SDFGs have their own control flow, so stop at the owning SDFG.
+        """
+        pivot = loop
+        while pivot.parent_graph is not None:
+            parent = pivot.parent_graph
+            if isinstance(parent, LoopRegion):
+                yield parent
+                yield from parent.all_control_flow_blocks()
+            pending = [edge.dst for edge in parent.out_edges(pivot)]
+            seen = set()
+            while pending:
+                reached = pending.pop()
+                if reached in seen:
+                    continue
+                seen.add(reached)
+                yield reached
+                if isinstance(reached, AbstractControlFlowRegion):
+                    yield from reached.all_control_flow_blocks()
+                pending.extend(edge.dst for edge in parent.out_edges(reached))
+            if isinstance(parent, dace.SDFG):
+                break
+            pivot = parent
 
     def _apply_recursive(self, sdfg: dace.SDFG) -> Set[str]:
         """Rename the loop iterators of ``sdfg`` and of every nested SDFG below it.
@@ -260,7 +288,7 @@ class UniqueLoopIterators(ppl.Pass):
                 # residual block loop makes frame-codegen declare a local
                 # shadowing the parameter -- a hard C++ compile error (see
                 # ``_post_value_needed``).
-                if self._post_value_needed(cfg, old_name, self._block_reach, self._blocks_reading):
+                if self._post_values_needed[cfg]:
                     post_value = self._compute_post_value(cfg)
                     if post_value is not None:
                         post_value_str = dace.symbolic.symstr(post_value, arrayexprs=array_names).strip()
@@ -339,23 +367,14 @@ class UniqueLoopIterators(ppl.Pass):
         :returns: The new iterator names assigned, or ``None`` if every iterator was already unique.
         """
         self._next_id = self._first_free_id(sdfg)
-        # The post-value assignment must only be emitted for a loop variable
-        # actually read after its loop (see ``_post_value_needed``). Deciding
-        # that needs forward control-flow reachability plus a symbol-reader
-        # index; both are computed ONCE here, before any rename mutates the
-        # graph, and only when the Fortran-specific post-value behaviour is
-        # enabled (pure Python / DaCe callers pay nothing). Renaming never
-        # adds or removes regions and the post-value states appended are pure
-        # writers, so neither map goes stale for the queries made.
-        self._block_reach: dict = {}
-        self._blocks_reading: dict = {}
+        # Query the original graph before renaming or inserting post-value states.
+        # Keep only one boolean per loop, rather than all-pairs block reachability.
+        self._post_values_needed = {}
         if self.assign_loop_iterator_post_value:
-            loop_vars = {
-                cfg.loop_variable
-                for cfg in sdfg.all_control_flow_regions(recursive=True)
-                if isinstance(cfg, LoopRegion) and cfg.loop_variable
+            loops = [cfg for cfg in sdfg.all_control_flow_regions(recursive=True)
+                     if isinstance(cfg, LoopRegion) and cfg.loop_variable]
+            readers = self._collect_symbol_readers(sdfg, {cfg.loop_variable for cfg in loops})
+            self._post_values_needed = {
+                cfg: self._post_value_needed(cfg, cfg.loop_variable, readers) for cfg in loops
             }
-            if loop_vars:
-                self._block_reach = ControlFlowBlockReachability().apply_pass(sdfg, {})
-                self._blocks_reading = self._collect_symbol_readers(sdfg, loop_vars)
         return self._apply_recursive(sdfg) or None

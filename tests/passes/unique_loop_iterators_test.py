@@ -785,3 +785,55 @@ def test_loop_and_map_coexist_no_collision_value_preserving():
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+@pytest.mark.parametrize('cycle', [False, True])
+def test_on_demand_reachability_matches_full_closure(cycle):
+    """Keep loop-exit decisions across nested loops, conditional arms and cycles."""
+    from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
+    from dace.transformation.passes.analysis import ControlFlowBlockReachability
+
+    graph = dace.SDFG('loop_successors')
+
+    def add_loop(parent, name):
+        loop = LoopRegion(name, condition_expr='i < 3', loop_var='i',
+                          initialize_expr='i = 0', update_expr='i = i + 1')
+        parent.add_node(loop)
+        loop.add_state(name + '_body', is_start_block=True)
+        return loop
+
+    first = graph.add_state('first', is_start_block=True)
+    outer = add_loop(graph, 'outer')
+    after = graph.add_state('after')
+    graph.add_edge(first, outer, dace.InterstateEdge())
+    graph.add_edge(outer, after, dace.InterstateEdge())
+    if cycle:
+        graph.add_edge(after, outer, dace.InterstateEdge())
+    conditional = ConditionalBlock('conditional')
+    outer.add_node(conditional)
+    outer.add_edge(outer.start_block, conditional, dace.InterstateEdge())
+    tail = add_loop(outer, 'tail')
+    outer.add_edge(conditional, tail, dace.InterstateEdge())
+    for index, condition in enumerate(['i > 0', None]):
+        arm = ControlFlowRegion('arm_' + str(index))
+        conditional.add_branch(condition, arm)
+        head = arm.add_state('head', is_start_block=True)
+        inner = add_loop(arm, 'inner_' + str(index))
+        arm.add_edge(head, inner, dace.InterstateEdge())
+        end = arm.add_state('end')
+        arm.add_edge(inner, end, dace.InterstateEdge())
+
+    full = ControlFlowBlockReachability().apply_pass(graph, {})
+    pass_ = UniqueLoopIterators()
+    for loop in graph.all_control_flow_regions():
+        if not isinstance(loop, LoopRegion):
+            continue
+        expected = set(full[loop.parent_graph.cfg_id][loop])
+        assert set(pass_._blocks_after(loop)) == expected
+        own = {loop}
+        for region in loop.all_control_flow_regions(recursive=True):
+            own.add(region)
+            own.update(region.nodes())
+        for reader in graph.all_control_flow_blocks():
+            expected_needed = reader in own or not expected or reader in expected
+            assert pass_._post_value_needed(loop, 'i', {'i': {reader}}) == expected_needed
