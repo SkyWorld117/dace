@@ -1032,13 +1032,38 @@ class InterstateEdgeUnparser(cppunparse.CPPUnparser):
 
     def _Subscript(self, t: ast.Subscript):
         from dace.frontend.python.astutils import subscript_to_slice
+        # Subset conversion makes nested reads symbolic, bypassing this unparser.
+        # Render them first so each uses its own strides, offsets and pointer name.
+        indirect = {}
+        if any(isinstance(node, ast.Subscript) for node in ast.walk(t.slice)):
+            used = {node.id for node in ast.walk(t) if isinstance(node, ast.Name)}
+            unparser = self
+
+            class IndirectIndices(ast.NodeTransformer):
+                def visit_Subscript(self, node):
+                    name = f'__dace_index_{len(indirect)}'
+                    while name in used:
+                        name += '_'
+                    used.add(name)
+                    rendered = StringIO()
+                    InterstateEdgeUnparser(unparser.sdfg, node, rendered,
+                                           defined_symbols=unparser.defined_symbols,
+                                           framecode=unparser.framecode)
+                    indirect[name] = '(' + rendered.getvalue().strip() + ')'
+                    return ast.copy_location(ast.Name(id=name, ctx=ast.Load()), node)
+
+            t = copy.deepcopy(t)
+            t.slice = IndirectIndices().visit(t.slice)
         target, rng = subscript_to_slice(t, self.sdfg.arrays)
         rng = subsets.Range(rng)
         if rng.num_elements() != 1:
             raise SyntaxError('Range subscripts disallowed in interstate edges')
 
         memlet = mmlt.Memlet(data=target, subset=rng)
-        self.write(cpp_array_expr(self.sdfg, memlet, framecode=self.framecode))
+        expression = cpp_array_expr(self.sdfg, memlet, framecode=self.framecode)
+        if indirect:
+            expression = re.sub(r'\b\w+\b', lambda match: indirect.get(match[0], match[0]), expression)
+        self.write(expression)
 
 
 class DaCeKeywordRemover(ExtNodeTransformer):
