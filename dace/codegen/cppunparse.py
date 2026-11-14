@@ -1033,6 +1033,7 @@ class CPPUnparser:
         # helpers live in the GLOBAL namespace in this fork's ``math.h`` (the ``dace::math`` block
         # starts below them), unlike ``ipow`` -- hence the bare spelling.
         'ipow': 'dace::math::ipow',
+        'pow': 'dace::math::pow',
         'FtnMod': 'cpp_mod',
         'FtnModulo': 'floor_mod',
     }
