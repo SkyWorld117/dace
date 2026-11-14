@@ -21,6 +21,13 @@ if TYPE_CHECKING:
 tokenize_cpp = re.compile(r'\b\w+\b')
 
 
+def _replacement_name(value):
+    # Ordinary symbols already store their printed name. Avoid invoking SymPy's
+    # printer for every alias at every descriptor/memlet in a large replacement.
+    # Subclasses such as Dummy or Attr retain their own printing semantics.
+    return value.name if type(value) in (sp.Symbol, symbolic.symbol) else str(value)
+
+
 def _internal_replace(sym, symrepl):
     # A SymExpr is a (exact, over-approximation) pair, not a sympy.Basic, so the guard below
     # would hand it back untouched. Strip-mined bounds are SymExprs and sit in the same range
@@ -32,14 +39,14 @@ def _internal_replace(sym, symrepl):
         return sym
 
     # Filter out only relevant replacements
-    fsyms = set(map(str, sym.free_symbols))
+    fsyms = {_replacement_name(value) for value in sym.free_symbols}
     # TODO/NOTE: Could we return the generated strings below as free symbols from Attr instead or ther will be issues?
     for s in set(fsyms):
         if '.' in s:
             tokens = s.split('.')
             for i in range(1, len(tokens)):
                 fsyms.add('.'.join(tokens[:i]))
-    newrepl = {k: v for k, v in symrepl.items() if str(k) in fsyms}
+    newrepl = {k: v for k, v in symrepl.items() if _replacement_name(k) in fsyms}
     if not newrepl:
         return sym
 

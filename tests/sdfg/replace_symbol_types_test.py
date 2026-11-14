@@ -5,6 +5,7 @@ or a ``Property(dtype=str)`` produces an SDFG that no longer serializes. This is
 ``SDFGState.add_nested_sdfg`` takes when it applies a nested SDFG's symbol mapping. """
 
 import dace
+import numpy as np
 from dace import symbolic
 from dace.sdfg.state import LoopRegion
 
@@ -16,13 +17,20 @@ def test_interstate_assignment_keys_stay_strings():
     start = sdfg.add_state('start', is_start_block=True)
     end = sdfg.add_state('end')
     sdfg.add_edge(start, end, dace.InterstateEdge(assignments={'i': '1'}))
+    sdfg.add_array('output', [1], dace.int64)
+    task = end.add_tasklet('store', {}, {'out'}, 'out = i')
+    end.add_edge(task, 'out', end.add_write('output'), None, dace.Memlet('output[0]'))
 
     symbolic.safe_replace({'i': 'k'}, lambda m: sdfg.replace_dict(m))
 
     edge = sdfg.edges()[0]
     assert all(isinstance(key, str) for key in edge.data.assignments), edge.data.assignments
     assert 'k' in edge.data.assignments, edge.data.assignments
+    assert set(sdfg.symbols) == {'k'}
     sdfg.to_json()
+    output = np.zeros(1, dtype=np.int64)
+    sdfg(output=output)
+    np.testing.assert_array_equal(output, [1])
 
 
 def test_loop_variable_stays_a_string():

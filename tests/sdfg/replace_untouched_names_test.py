@@ -92,3 +92,34 @@ if __name__ == '__main__':
     test_mapped_symbols_keep_dtype_and_assumptions_when_another_symbol_is_replaced()
     test_interstate_edge_without_a_replaced_name_is_left_untouched()
     test_interstate_edge_with_a_replaced_name_is_rewritten()
+
+
+def test_bulk_alias_filter_does_not_print_unrelated_symbols(monkeypatch):
+    import sympy as sp
+    from dace.sdfg.replace import _internal_replace
+
+    expression = sp.Symbol('retained') + 1
+    aliases = {sp.Symbol(f'bulk_{i}'): sp.Symbol('target') for i in range(256)}
+    original = sp.Symbol.__str__
+
+    def refuse_unrelated_printing(value):
+        if value.name.startswith('bulk_'):
+            raise AssertionError('unrelated alias sent through the symbolic printer')
+        return original(value)
+
+    monkeypatch.setattr(sp.Symbol, '__str__', refuse_unrelated_printing)
+    assert _internal_replace(expression, aliases) is expression
+
+
+def test_bulk_alias_filter_preserves_typed_symbols_and_dummy_names():
+    import sympy as sp
+    from dace.sdfg.replace import _internal_replace
+
+    typed = dace.symbol('typed', dtype=dace.int64, nonnegative=True)
+    dummy = sp.Dummy('iteration')
+    target = dace.symbol('target', dtype=dace.int64, nonnegative=True)
+    expression = typed + dummy
+    result = _internal_replace(expression, {typed: target, dummy: 3})
+    assert result == target + 3
+    retained = next(iter(result.free_symbols))
+    assert retained.dtype == dace.int64 and retained.is_nonnegative

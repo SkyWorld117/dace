@@ -460,7 +460,7 @@ class InterstateEdge(object):
                 # Guard as SDFG.replace_dict does: a non-name replacement (e.g. a symbolic
                 # expression, or a Symbol carrying assumptions that maps a name to itself)
                 # must not become an assignment key -- only rename when new_name is a valid name.
-                if validate_name(new_name):
+                if validate_name(str(new_name)):
                     _replace_dict_keys(self.assignments, name, new_name)
 
         # Rewrite only what names a key: re-spelling the rest would drop the parsed condition and its caches.
@@ -1007,7 +1007,7 @@ class SDFG(ControlFlowRegion):
             # Filter out nested data names, as we cannot and do not want to replace names in nested data descriptors
             repldict_filtered = {k: v for k, v in repldict.items() if '.' not in k}
             for name, new_name in repldict_filtered.items():
-                if validate_name(new_name):
+                if validate_name(str(new_name)):
                     _replace_dict_keys(self._arrays, name, new_name)
                     _replace_dict_keys(self.symbols, name, new_name)
                     _replace_dict_keys(self.constants_prop, name, new_name)
