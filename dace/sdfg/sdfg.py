@@ -296,17 +296,11 @@ class InterstateEdge(object):
         key_type=str,
         value_type=str,
         desc="Assignments to perform upon transition (e.g., 'x=x+1; y = 0')",
-        # NOTE: We serialize assignments as symbolic expressions but store them as strings of CodeBlocks (mostly with
-        #       language=Python). In a future version, we will modify the value type to sympy.Basic and store the
-        #       assignments as symbolic expressions without specialized to/from_json functions.
-        to_json=lambda d: {
-            k: symbolic.symstr(symbolic.pystr_to_symbolic(v))
-            for k, v in d.items()
-        },
-        from_json=(lambda d, *args, context=None, **kwargs: {
-            k: symbolic.symstr(symbolic.pystr_to_symbolic(v))
-            for k, v in d.items()
-        }))
+        # Assignments are executable Python expressions. Symbolic parsing can
+        # discard literal casts and reassociate floating-point operations, so
+        # preserve their source across graph checkpoints.
+        to_json=lambda d: dict(d),
+        from_json=lambda d, *args, **kwargs: dict(d))
     condition = CodeProperty(desc="Transition condition", default=CodeBlock("1"))
     guid = Property(dtype=str, allow_none=False)
 
