@@ -15,6 +15,7 @@ programs leave the iterator at. ON by default as it does not affect
 Python/SDFG API inputs.
 """
 
+from collections import Counter
 from typing import Optional, Set, Union
 
 import dace
@@ -259,7 +260,7 @@ class UniqueLoopIterators(ppl.Pass):
         loop_vars = [
             r.loop_variable for r in sdfg.all_control_flow_regions() if isinstance(r, LoopRegion) and r.loop_variable
         ]
-        duplicated = {v for v in loop_vars if loop_vars.count(v) > 1}
+        duplicated = {v for v, count in Counter(loop_vars).items() if count > 1}
         for cfg in sdfg.all_control_flow_regions():
             if not isinstance(cfg, LoopRegion):
                 continue
@@ -366,13 +367,21 @@ class UniqueLoopIterators(ppl.Pass):
         :param _: Pipeline results (unused).
         :returns: The new iterator names assigned, or ``None`` if every iterator was already unique.
         """
+        loops = []
+        for graph in sdfg.all_sdfgs_recursive():
+            local = [cfg for cfg in graph.all_control_flow_regions()
+                     if isinstance(cfg, LoopRegion) and cfg.loop_variable]
+            counts = Counter(cfg.loop_variable for cfg in local)
+            loops.extend(cfg for cfg in local
+                         if not cfg.loop_variable.startswith(f"{_LOOP_ITER_NAME_PREFIX}_")
+                         or counts[cfg.loop_variable] > 1)
+        if not loops:
+            return None
         self._next_id = self._first_free_id(sdfg)
         # Query the original graph before renaming or inserting post-value states.
         # Keep only one boolean per loop, rather than all-pairs block reachability.
         self._post_values_needed = {}
         if self.assign_loop_iterator_post_value:
-            loops = [cfg for cfg in sdfg.all_control_flow_regions(recursive=True)
-                     if isinstance(cfg, LoopRegion) and cfg.loop_variable]
             readers = self._collect_symbol_readers(sdfg, {cfg.loop_variable for cfg in loops})
             self._post_values_needed = {
                 cfg: self._post_value_needed(cfg, cfg.loop_variable, readers) for cfg in loops
