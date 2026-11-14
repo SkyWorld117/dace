@@ -9,6 +9,7 @@ Covers:
 * 0-based vs 1-based output via ``one_based``
 """
 import numpy as np
+import pytest
 
 import dace
 from dace.libraries.standard.nodes import ArgMin, ArgMax
@@ -142,3 +143,24 @@ if __name__ == '__main__':
     test_argmax_2d_dim1()
     test_argmin_2d_dim2()
     print('ArgMin / ArgMax library node tests PASS')
+
+
+@pytest.mark.parametrize("node_cls", [ArgMin, ArgMax])
+@pytest.mark.parametrize("back", [False, True])
+def test_dynamic_reduction_axis(tmp_path, node_cls, back):
+    """Runtime section lengths retain first/last ties and empty-section results."""
+    length = dace.symbolic.pystr_to_symbolic("Max(0, N + 1)")
+    graph = _build_dim(node_cls, [length, 3], 1, dace.float64, back=back)
+    graph.name = f"{node_cls.__name__}_dynamic_{int(back)}"
+    graph.build_folder = str(tmp_path / "build")
+    compiled = graph.compile()
+    for size in (2, 7, 0, 4):
+        values = np.zeros((size, 3), dtype=np.float64)
+        output = np.full(3, -99, dtype=np.int32)
+        if size:
+            extreme = -7.0 if node_cls is ArgMin else 7.0
+            values[0] = extreme
+            values[-1] = extreme
+        compiled(v=values, idx=output, N=size - 1)
+        expected = (size if back else 1) if size else 0
+        np.testing.assert_array_equal(output, np.full(3, expected, dtype=np.int32))

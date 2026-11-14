@@ -99,7 +99,7 @@ def _emit_pure(node, parent_state: SDFGState, parent_sdfg: SDFG, func: str):
     if flat:
         total = _flat_size(shape)
     else:
-        total = int(shape[dim_zero])
+        total = shape[dim_zero]
     idx_sentinel = -1 if node.back else total
     idx_wcr_op = "max" if node.back else "min"
 
@@ -213,7 +213,7 @@ def _emit_pure(node, parent_state: SDFGState, parent_sdfg: SDFG, func: str):
             name="extract_idx",
             map_ranges=rng,
             inputs={"__in": dace.Memlet(f"__best_idx[{out_subs}]")},
-            code=f"__out = __in + {one_offset}",
+            code=f"__out = (__in + {one_offset}) if __in != ({idx_sentinel}) else {0 if node.one_based else -1}",
             outputs={"__out": dace.Memlet(f"_idx[{out_subs}]")},
             external_edges=True,
         )
