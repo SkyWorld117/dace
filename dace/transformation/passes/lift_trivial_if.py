@@ -130,7 +130,9 @@ class LiftTrivialIf(ppl.Pass):
     def _loop_iter_ranges(self, cfb: ConditionalBlock):
         """The ``(loop_variable, start, end)`` iteration range of every
         ``LoopRegion`` enclosing ``cfb``, innermost first. ``start`` / ``end`` are
-        the inclusive bounds under normal (no-break) termination."""
+        the inclusive lower / upper bounds under normal (no-break) termination.
+        Descending loops reverse their initial and terminal bounds; an unknown
+        stride sign cannot establish an ordered interval."""
         from dace.sdfg.state import LoopRegion
         from dace.transformation.passes.analysis import loop_analysis
         ranges = []
@@ -141,8 +143,13 @@ class LiftTrivialIf(ppl.Pass):
             if isinstance(graph, LoopRegion) and graph.loop_variable:
                 start = loop_analysis.get_init_assignment(graph)
                 end = loop_analysis.get_loop_end(graph)
-                if start is not None and end is not None:
-                    ranges.append((graph.loop_variable, start, end))
+                step = loop_analysis.get_loop_stride(graph)
+                if start is not None and end is not None and step is not None:
+                    step = symbolic.simplify(step)
+                    if step.is_positive:
+                        ranges.append((graph.loop_variable, start, end))
+                    elif step.is_negative:
+                        ranges.append((graph.loop_variable, end, start))
             graph = getattr(graph, 'parent_graph', None)
         return ranges
 

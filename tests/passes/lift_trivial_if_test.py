@@ -384,6 +384,41 @@ def test_iteration_range_symbolic_upper_bound():
     assert _num_conditionals(tauto) == 0
 
 
+@pytest.mark.parametrize("condition,remaining", [
+    ("i < 9", 1), ("i == 5", 1), ("i < 2", 0), ("i <= 9", 0),
+])
+def test_descending_iteration_range(condition, remaining):
+    """Descending endpoints must be ordered before proving a guard constant."""
+    sdfg = _get_loop_with_conditional(condition, init="i = 9", cond="i >= 2", update="i = i - 1")
+    LiftTrivialIf().apply_pass(sdfg, {})
+    sdfg.validate()
+    assert _num_conditionals(sdfg) == remaining
+
+
+def test_descending_symbolic_range_executes_guarded_copy(tmp_path):
+    """The non-top-level sedimentation guard must survive simplify and execute."""
+    import numpy as np
+
+    sdfg = _get_loop_with_conditional("i < N - 1", init="i = N - 1", cond="i >= 0", update="i = i - 1")
+    sdfg.add_symbol("N", dace.int32)
+    sdfg.simplify()
+    sdfg.validate()
+    assert _num_conditionals(sdfg) == 1
+    sdfg.build_folder = str(tmp_path / "descending_guard")
+    a = np.arange(1, 11, dtype=np.float64)
+    b = np.zeros(10)
+    sdfg(A=a, B=b, N=10)
+    np.testing.assert_array_equal(b, a)
+
+
+def test_unknown_stride_sign_preserves_guard():
+    sdfg = _get_loop_with_conditional("i < 9", init="i = 9", cond="i >= 2", update="i = i + step")
+    sdfg.add_symbol("step", dace.int32)
+    LiftTrivialIf().apply_pass(sdfg, {})
+    sdfg.validate()
+    assert _num_conditionals(sdfg) == 1
+
+
 def test_iteration_range_no_enclosing_loop_is_not_folded():
     """Without an enclosing loop there is no iteration range, so ``i == 0`` is a
     free-symbol condition the pass must leave alone."""
