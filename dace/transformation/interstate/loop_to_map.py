@@ -379,9 +379,13 @@ class LoopToMap(xf.MultiStateTransformation):
                         # is an unbound descriptor and raises on anything but a ``set``.
                         symbols_that_may_be_used |= per_branch[0].intersection(*per_branch[1:])
 
-                # ``read_symbols()`` misses the block's own dataflow reads, which come first.
+                # Visit each read at its execution point. The recursive traversal
+                # also emits compound blocks before their descendants; counting a
+                # region's aggregate free symbols here moves later reads before
+                # assignments inside the region. Retain its own loop/branch guards.
                 try:
-                    block_reads = OrderedSet(str(s) for s in block.free_symbols)
+                    block_reads = OrderedSet(str(s) for s in block.used_symbols(
+                        True, with_contents=not isinstance(block, (ControlFlowRegion, ConditionalBlock))))
                 except Exception:
                     block_reads = OrderedSet()
                 used_before_assignment |= (block_reads - symbols_that_may_be_used)

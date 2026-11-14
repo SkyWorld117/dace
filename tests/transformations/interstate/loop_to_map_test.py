@@ -1475,3 +1475,38 @@ def test_inner_map_propagation_does_not_hide_cross_column_reads():
     expected[:4] = values[1:] * 2
     sdfg(A=values)
     np.testing.assert_array_equal(values, expected)
+
+
+@pytest.mark.parametrize("carried", [False, True])
+def test_nested_search_reads_follow_their_local_assignment(carried):
+    """A branch-local search result is initialized before its use after the search."""
+    sdfg = dace.SDFG("column_search_carried" if carried else "column_search")
+    for symbol in ("i", "nn", "n"):
+        sdfg.add_symbol(symbol, dace.int32)
+    sdfg.add_array("A", [4], dace.int32)
+    outer = LoopRegion("columns", "i < 4", "i", "i = 0", "i = i + 1")
+    sdfg.add_node(outer, is_start_block=True)
+    choose = ConditionalBlock("choose")
+    outer.add_node(choose, is_start_block=True)
+    branch = ControlFlowRegion("active", sdfg=sdfg)
+    choose.add_branch(dace.properties.CodeBlock("i != 1"), branch)
+    search = LoopRegion("search", "nn < 6", "nn", "nn = 0", "nn = nn + 1")
+    branch.add_node(search, is_start_block=True)
+    assign = search.add_state("assign", is_start_block=True)
+    check = ConditionalBlock("check")
+    search.add_node(check)
+    search.add_edge(assign, check, dace.InterstateEdge(assignments={"n": "n + 1" if carried else "nn"}))
+    leave = ControlFlowRegion("found", sdfg=sdfg)
+    leave.add_node(BreakBlock("stop"), is_start_block=True)
+    check.add_branch(dace.properties.CodeBlock("nn >= i + 1"), leave)
+    store = branch.add_state("store")
+    branch.add_edge(search, store, dace.InterstateEdge())
+    task = store.add_tasklet("store", {}, {"out"}, "out = n;", language=dace.Language.CPP)
+    store.add_edge(task, "out", store.add_write("A"), None, dace.Memlet("A[i]"))
+    sdfg.validate()
+    assert LoopToMap.can_be_applied_to(sdfg, loop=outer) == (not carried)
+    if not carried:
+        LoopToMap.apply_to(sdfg, loop=outer)
+        output = np.full(4, -1, dtype=np.int32)
+        sdfg(A=output)
+        np.testing.assert_array_equal(output, [1, -1, 3, 4])
