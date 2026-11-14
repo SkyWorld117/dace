@@ -647,6 +647,21 @@ namespace dace
             return result;
         }
 
+        // Balance small compile-time powers instead of appending a multiply
+        // after squaring. For x**5, (x*x)*(x*(x*x)) retains the rounding of
+        // native Fortran constant-power lowering; ((x*x)*(x*x))*x can differ.
+        template<unsigned int N, typename T>
+        DACE_HDFI T ipow_balanced(const T& a) {
+            static_assert(N >= 1 && N <= 10, "small constant power required");
+            if constexpr (N == 1) {
+                return a;
+            } else {
+                const T lower = ipow_balanced<N / 2>(a);
+                if constexpr (N % 2 == 0) return lower * lower;
+                else return lower * ipow_balanced<N - N / 2>(a);
+            }
+        }
+
         template<typename T, typename std::enable_if<std::is_integral<T>::value>::type* = nullptr>
         DACE_CONSTEXPR DACE_HDFI T ifloor(const T& a)
         {

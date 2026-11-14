@@ -43,3 +43,30 @@ def test_ipow_zero_and_large_integral_exponent():
     graph(A=values, E=powers, B=output)
     expected = np.power(values[None, :], powers[:, None].astype(np.int64))
     assert np.array_equal(output, expected)
+
+
+@pytest.mark.parametrize('dtype', [dace.float32, dace.float64])
+def test_small_constant_powers_balanced_rounding(dtype, tmp_path):
+    """Small literal powers use balanced products, as in native Fortran lowering."""
+    values = np.array([0., -0., -1., 1., 0.000019876, *np.linspace(.2, 1.6, 31)],
+                      dtype=dtype.as_numpy_dtype())
+    graph = dace.SDFG('constant_powers_' + str(dtype))
+    graph.build_folder = str(tmp_path / 'build')
+    graph.add_array('A', [len(values)], dtype)
+    graph.add_array('B', [9, len(values)], dtype)
+    state = graph.add_state()
+    for power in range(2, 11):
+        state.add_mapped_tasklet(
+            'power_' + str(power), {'i': f'0:{len(values)}'},
+            {'x': dace.Memlet('A[i]')}, f'out = x ** {power}',
+            {'out': dace.Memlet(f'B[{power-2}, i]')}, external_edges=True)
+    output = np.empty((9, len(values)), dtype=values.dtype)
+    graph(A=values, B=output)
+
+    def balanced(power):
+        if power == 1:
+            return values
+        return balanced(power // 2) * balanced(power - power // 2)
+
+    expected = np.array([balanced(power) for power in range(2, 11)])
+    assert output.tobytes() == expected.tobytes()

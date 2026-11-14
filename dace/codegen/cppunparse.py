@@ -891,6 +891,12 @@ class CPPUnparser:
                         self.write("(")
                     if power == 0:
                         self.write("1")
+                    elif power in (5, 7, 9, 10):
+                        # Other powers up to ten already have the balanced
+                        # product order in ipow's repeated-squaring path.
+                        self.write(f"dace::math::ipow_balanced<{power}>(")
+                        self.dispatch(t.left)
+                        self.write(")")
                     else:
                         self.write("dace::math::ipow(")
                         self.dispatch(t.left)
