@@ -165,3 +165,67 @@ def test_dynamic_reduction_axis(tmp_path, node_cls, back, rank):
         compiled(v=values, idx=output, N=size - 1)
         expected = (size if back else 1) if size else 0
         np.testing.assert_array_equal(output, np.full(output.shape, expected, dtype=np.int32))
+
+
+def nested_device_argmin():
+    root = dace.SDFG('device_argmin')
+    child = dace.SDFG('argmin_leaf')
+    for graph in (root,child):
+        graph.add_array('v',['N'],dace.float32,storage=dace.StorageType.GPU_Global)
+        graph.add_array('idx',[1],dace.int32,storage=dace.StorageType.GPU_Global)
+    state = child.add_state()
+    node = ArgMin('minimum',dim=1,one_based=True,schedule=dace.ScheduleType.Sequential)
+    state.add_node(node)
+    state.add_edge(state.add_read('v'),None,node,'_x',dace.Memlet('v[0:N]'))
+    state.add_edge(node,'_idx',state.add_write('idx'),None,dace.Memlet('idx[0]'))
+    state = root.add_state()
+    entry,exit = state.add_map('whole_leaf',{'lane':'0:1'},schedule=dace.ScheduleType.GPU_Device)
+    call = state.add_nested_sdfg(child,['v','idx'],['idx'],symbol_mapping={'N':'N'})
+    for name in ['v','idx']:
+        state.add_memlet_path(state.add_read(name),entry,call,dst_conn=name,
+                              memlet=dace.Memlet.from_array(name,root.arrays[name]))
+    state.add_memlet_path(call,exit,state.add_write('idx'),src_conn='idx',memlet=dace.Memlet('idx[0]'))
+    return root
+
+
+def test_argmin_in_device_thread_keeps_private_storage():
+    graph = nested_device_argmin()
+    graph.expand_library_nodes()
+    scratch = [desc for child in graph.all_sdfgs_recursive() for name,desc in child.arrays.items()
+               if name in ['__best_val','__best_idx']]
+    assert len(scratch) == 2
+    assert all(desc.storage == dace.StorageType.Register for desc in scratch)
+    graph.generate_code()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1',reason='requires GPU')
+def test_argmin_in_device_thread_repeats_on_gpu(tmp_path):
+    import ctypes as ct
+    runtime = ct.CDLL('libcudart.so')
+    runtime.cudaMalloc.argtypes = [ct.POINTER(ct.c_void_p),ct.c_size_t]
+    runtime.cudaMemcpy.argtypes = [ct.c_void_p,ct.c_void_p,ct.c_size_t,ct.c_int]
+    runtime.cudaFree.argtypes = [ct.c_void_p]
+    graph = nested_device_argmin()
+    graph.build_folder = str(tmp_path/'device_argmin')
+    compiled = graph.compile()
+    class DeviceArray:
+        def __init__(self,array):
+            self.pointer = ct.c_void_p()
+            assert runtime.cudaMalloc(ct.byref(self.pointer),array.nbytes) == 0
+            self.__cuda_array_interface__ = dict(shape=array.shape,strides=array.strides,
+                typestr=array.dtype.str,data=(self.pointer.value,False),version=3)
+    for length,position in [(7,2),(11,9),(7,5)]:
+        values = np.ones(length,dtype=np.float32)
+        values[position-1:position+1] = -3.
+        result = np.full(1,-19,dtype=np.int32)
+        buffers = [DeviceArray(array) for array in [values,result]]
+        try:
+            for host,gpu in zip([values,result],buffers):
+                assert runtime.cudaMemcpy(gpu.pointer,host.ctypes.data,host.nbytes,1) == 0
+            compiled(v=buffers[0],idx=buffers[1],N=np.int64(length))
+            assert runtime.cudaMemcpy(result.ctypes.data,buffers[1].pointer,result.nbytes,2) == 0
+            np.testing.assert_array_equal(result,[position])
+        finally:
+            for gpu in buffers:
+                assert runtime.cudaFree(gpu.pointer) == 0

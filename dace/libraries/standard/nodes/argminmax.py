@@ -88,8 +88,15 @@ def _emit_pure(node, parent_state: SDFGState, parent_sdfg: SDFG, func: str):
         if not per_slice_shape:
             per_slice_shape = [1]
         sdfg.add_array("_idx", per_slice_shape, idx_dtype)
-    sdfg.add_transient("__best_val", per_slice_shape, dtype)
-    sdfg.add_transient("__best_idx", per_slice_shape, idx_dtype)
+    from dace.sdfg.scope import is_devicelevel_gpu
+    # These accumulators belong to the invoking device thread. Inferring
+    # CPU heap storage from the node's Sequential schedule leaks host pointers
+    # into the kernel when the expansion is nested under a GPU map.
+    private_storage = (dtypes.StorageType.Register
+                       if is_devicelevel_gpu(parent_sdfg,parent_state,node)
+                       else dtypes.StorageType.Default)
+    sdfg.add_transient("__best_val", per_slice_shape, dtype, storage=private_storage)
+    sdfg.add_transient("__best_idx", per_slice_shape, idx_dtype, storage=private_storage)
 
     val_identity = str(dtypes.max_value(dtype)) if func == "min" else str(dtypes.min_value(dtype))
     # Sentinel for the idx reduction: ``num_elements`` is larger than any
