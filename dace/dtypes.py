@@ -1548,7 +1548,7 @@ def paramdec(dec):
 
 def deduplicate(iterable):
     """ Removes duplicates in the passed iterable. """
-    return type(iterable)([i for i in sorted(set(iterable), key=lambda x: iterable.index(x))])
+    return type(iterable)(list(dict.fromkeys(iterable)))
 
 
 namere = re.compile(r'^[a-zA-Z_][a-zA-Z_0-9]*$')
