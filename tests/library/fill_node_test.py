@@ -563,3 +563,80 @@ def test_fill_dynamic_value_gpu_routes_to_cuda_for_32bit():
     code = _generated_code(sdfg)
     assert 'MemsetAsync' in code
     assert f"{FillLibraryNode.VALUE_CONNECTOR_NAME}" in code
+
+
+def nested_device_fills():
+    """Different fill ranks share an existing device thread, including a dynamic value."""
+    root = dace.SDFG('nested_device_fills')
+    child = dace.SDFG('fill_leaf')
+    for graph in (root,child):
+        for name,shape in [('A',[3,4]),('B',[3,4,2]),('seed',[1])]:
+            graph.add_array(name,shape,dace.float32,storage=dace.StorageType.GPU_Global)
+    before = None
+    for name,value in [('A',3.5),('B',0.0)]:
+        state = child.add_state('fill_'+name)
+        if before is not None:
+            child.add_edge(before,state,dace.InterstateEdge())
+        before = state
+        fill = FillLibraryNode('fill_'+name,value=value)
+        state.add_node(fill)
+        state.add_edge(fill,FillLibraryNode.OUTPUT_CONNECTOR_NAME,state.add_write(name),None,
+                       dace.Memlet.from_array(name,child.arrays[name]))
+        if name == 'B':
+            state.add_edge(state.add_read('seed'),None,fill,FillLibraryNode.VALUE_CONNECTOR_NAME,
+                           dace.Memlet('seed[0]'))
+    state = root.add_state()
+    entry,exit = state.add_map('whole_leaf',{'lane':'0:1'},schedule=dace.ScheduleType.GPU_Device)
+    call = state.add_nested_sdfg(child,['A','B','seed'],['A','B'])
+    for name in ['A','B','seed']:
+        state.add_memlet_path(state.add_read(name),entry,call,dst_conn=name,
+                              memlet=dace.Memlet.from_array(name,root.arrays[name]))
+    for name in ['A','B']:
+        state.add_memlet_path(call,exit,state.add_write(name),src_conn=name,
+                              memlet=dace.Memlet.from_array(name,root.arrays[name]))
+    return root
+
+
+def test_nested_global_fills_keep_one_device_grid():
+    graph = nested_device_fills()
+    graph.expand_library_nodes()
+    maps = [node for node,_ in graph.all_nodes_recursive() if isinstance(node,dace.nodes.MapEntry)]
+    assert sum(node.schedule == dace.ScheduleType.GPU_Device for node in maps) == 1
+    assert sum(node.schedule == dace.ScheduleType.Sequential for node in maps) == 2
+    graph.generate_code()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(__import__('os').environ.get('DACE_TEST_GPU') != '1',reason='requires GPU')
+def test_nested_global_fills_repeat_on_gpu(tmp_path):
+    import ctypes as ct
+    runtime = ct.CDLL('libcudart.so')
+    runtime.cudaMalloc.argtypes = [ct.POINTER(ct.c_void_p),ct.c_size_t]
+    runtime.cudaMemcpy.argtypes = [ct.c_void_p,ct.c_void_p,ct.c_size_t,ct.c_int]
+    runtime.cudaFree.argtypes = [ct.c_void_p]
+    graph = nested_device_fills()
+    graph.build_folder = str(tmp_path/'nested_fills')
+    compiled = graph.compile()
+    class DeviceArray:
+        def __init__(self,array):
+            self.pointer = ct.c_void_p()
+            assert runtime.cudaMalloc(ct.byref(self.pointer),array.nbytes) == 0
+            self.__cuda_array_interface__ = dict(shape=array.shape,strides=array.strides,
+                typestr=array.dtype.str,data=(self.pointer.value,False),version=3)
+    arrays = [np.full((3,4),-19,dtype=np.float32),np.full((3,4,2),-19,dtype=np.float32),np.zeros(1,dtype=np.float32)]
+    device = [DeviceArray(array) for array in arrays]
+    try:
+        for value in (-2.25,7.,0.):
+            arrays[0][:] = -19
+            arrays[1][:] = -19
+            arrays[2][:] = value
+            for host,gpu in zip(arrays,device):
+                assert runtime.cudaMemcpy(gpu.pointer,host.ctypes.data,host.nbytes,1) == 0
+            compiled(A=device[0],B=device[1],seed=device[2])
+            for host,gpu in zip(arrays[:2],device[:2]):
+                assert runtime.cudaMemcpy(host.ctypes.data,gpu.pointer,host.nbytes,2) == 0
+            np.testing.assert_array_equal(arrays[0],3.5)
+            np.testing.assert_array_equal(arrays[1],value)
+    finally:
+        for gpu in device:
+            assert runtime.cudaFree(gpu.pointer) == 0
