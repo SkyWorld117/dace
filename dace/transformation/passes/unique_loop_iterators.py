@@ -156,7 +156,13 @@ class UniqueLoopIterators(ppl.Pass):
         readers: dict = {}
         for cfr in top_sdfg.all_control_flow_regions(recursive=True):
             for block in cfr.nodes():
-                for sym in block.free_symbols & of_interest:
+                # Descendant blocks are visited separately. Asking a region
+                # for recursive free symbols at every nesting level repeatedly
+                # rescans all of its memlets. Region-local conditions and loop
+                # bounds still count here; successor queries visit descendants.
+                symbols = (block.used_symbols(False, with_contents=False)
+                           if isinstance(block, AbstractControlFlowRegion) else block.free_symbols)
+                for sym in symbols & of_interest:
                     readers.setdefault(sym, set()).add(block)
             for edge in cfr.edges():
                 for sym in edge.data.read_symbols() & of_interest:

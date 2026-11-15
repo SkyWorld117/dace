@@ -837,3 +837,47 @@ def test_on_demand_reachability_matches_full_closure(cycle):
         for reader in graph.all_control_flow_blocks():
             expected_needed = reader in own or not expected or reader in expected
             assert pass_._post_value_needed(loop, 'i', {'i': {reader}}) == expected_needed
+
+
+@pytest.mark.parametrize('program', [nested_loops, sibling_kbound_loops])
+def test_local_symbol_readers_preserve_aggregate_post_value_decisions(program):
+    graph = program.to_sdfg(simplify=False)
+    pass_ = UniqueLoopIterators()
+    loops = [region for region in graph.all_control_flow_regions(recursive=True)
+             if isinstance(region, LoopRegion) and region.loop_variable]
+    interested = {loop.loop_variable for loop in loops}
+    original = {}
+    for region in graph.all_control_flow_regions(recursive=True):
+        for block in region.nodes():
+            for symbol in block.free_symbols & interested:
+                original.setdefault(symbol,set()).add(block)
+        for edge in region.edges():
+            for symbol in edge.data.read_symbols() & interested:
+                original.setdefault(symbol,set()).add(edge.dst)
+    local = pass_._collect_symbol_readers(graph,interested)
+    for loop in loops:
+        assert pass_._post_value_needed(loop,loop.loop_variable,local) == pass_._post_value_needed(loop,loop.loop_variable,original)
+
+
+def test_symbol_reader_collection_visits_each_state_once(monkeypatch):
+    from dace.sdfg.state import ControlFlowRegion, SDFGState
+    graph = dace.SDFG('deep_symbol_readers')
+    graph.add_array('out',[1],dace.int32)
+    graph.add_symbol('i',dace.int32)
+    parent = graph
+    for depth in range(24):
+        region = ControlFlowRegion('region_'+str(depth))
+        parent.add_node(region,is_start_block=True)
+        parent = region
+    leaf = parent.add_state('leaf',is_start_block=True)
+    tasklet = leaf.add_tasklet('read',{}, {'value'},'value = i')
+    leaf.add_edge(tasklet,'value',leaf.add_write('out'),None,dace.Memlet('out[0]'))
+    original = SDFGState.used_symbols
+    calls = []
+    def counted(self,*args,**kwargs):
+        calls.append(self)
+        return original(self,*args,**kwargs)
+    monkeypatch.setattr(SDFGState,'used_symbols',counted)
+    readers = UniqueLoopIterators()._collect_symbol_readers(graph,{'i'})
+    assert readers['i']=={leaf}
+    assert calls==[leaf]
