@@ -1262,6 +1262,21 @@ def _get_dominator_and_postdominator(
             raise NotImplementedError(f'Could not find an appropriate post-dominator for deallocation of "{data_name}"')
         end_state = postdom.immediate[end_state]
 
+    # Post-dominance inside a structured loop describes one iteration. If
+    # allocation was placed outside that loop, freeing at its last use inside
+    # the body leaves later iterations using the same freed pointer. Advance
+    # to the loop's exit boundary (codegen pads structured regions with states).
+    start_regions = set()
+    region = start_state.parent_graph
+    while region is not None:
+        start_regions.add(region)
+        region = region.parent_graph
+    region = end_state.parent_graph
+    while region is not None:
+        if isinstance(region, LoopRegion) and region not in start_regions:
+            end_state = postdom.immediate[region]
+        region = region.parent_graph
+
     # TODO(later): If any of the symbols were not yet defined, or have changed afterwards, fail
     # raise NotImplementedError
 
