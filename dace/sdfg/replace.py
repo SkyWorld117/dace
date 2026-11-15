@@ -255,16 +255,23 @@ def replace_properties_dict(node: Any,
         for symname, new_name in repl.items()
     }
 
+    named_keys = all(isinstance(key, sp.Symbol) for key in symrepl)
+    keys_by_name = None
     for propclass, propval in node.properties():
         if propval is None:
             continue
         pname = propclass.attr_name
         if isinstance(propclass, properties.SymbolicProperty):
             # NOTE: `propval` can be a numeric constant instead of a symbolic expression.
-            if not symbolic.issymbolic(propval):
-                setattr(node, pname, symbolic.pystr_to_symbolic(str(propval)).subs(symrepl))
+            expression = propval if symbolic.issymbolic(propval) else symbolic.pystr_to_symbolic(str(propval))
+            if named_keys:
+                if keys_by_name is None:
+                    keys_by_name = symbolic.keys_by_free_name(symrepl)
+                expression = symbolic.subs_reachable(expression,symrepl,keys_by_name)
             else:
-                setattr(node, pname, propval.subs(symrepl))
+                # Numeric/composite replacement keys retain general SymPy semantics.
+                expression = expression.subs(symrepl)
+            setattr(node,pname,expression)
         elif isinstance(propclass, properties.DataProperty):
             if propval in repl:
                 setattr(node, pname, repl[propval])

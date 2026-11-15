@@ -51,3 +51,34 @@ def test_loop_variable_stays_a_string():
 if __name__ == '__main__':
     test_interstate_assignment_keys_stay_strings()
     test_loop_variable_stays_a_string()
+
+
+def test_symbolic_property_replacement_preserves_chains_and_numeric_keys():
+    import sympy as sp
+    from dace.sdfg.replace import replace_properties_dict
+    n,m,k=sp.symbols('n m k')
+    for expression,replacements in [(n+3,{n:m+2,m:7,k:99}),
+                                     (n+m,{n:m,m:k}),
+                                     (sp.Integer(4),{sp.Integer(4):8,n:0})]:
+        descriptor=dace.data.Array(dace.int32,[1])
+        descriptor.total_size=expression
+        replace_properties_dict(descriptor,{},replacements)
+        assert descriptor.total_size==expression.subs(replacements)
+
+
+def test_symbolic_property_does_not_substitute_unrelated_aliases(monkeypatch):
+    import sympy as sp
+    from dace.sdfg.replace import replace_properties_dict
+    n=sp.Symbol('n')
+    expression=n+1
+    replacements={sp.Symbol('unused_'+str(i)):sp.Integer(i) for i in range(1000)}
+    replacements[n]=sp.Integer(7)
+    descriptor=dace.data.Array(dace.int32,[1]);descriptor.total_size=expression
+    original=sp.Basic.subs
+    def checked(self,*args,**kwargs):
+        if self==expression and args and isinstance(args[0],dict):
+            assert len(args[0])==1
+        return original(self,*args,**kwargs)
+    monkeypatch.setattr(sp.Basic,'subs',checked)
+    replace_properties_dict(descriptor,{},replacements)
+    assert descriptor.total_size==8
