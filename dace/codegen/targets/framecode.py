@@ -615,11 +615,21 @@ DACE_EXPORTED void __dace_set_external_memory_{storage.name}({mangle_dace_state_
         fsyms = {}
         reachability = StateReachability().apply_pass(top_sdfg, {})
         dominance = {}
+        control_reads = {}
         access_instances: Dict[int, Dict[str, List[Tuple[SDFGState, nodes.AccessNode]]]] = {}
         code_instances: Dict[int, Dict[str, List[Tuple[SDFGState, nodes.Node]]]] = {}
         for sdfg in top_sdfg.all_sdfgs_recursive():
             shared_transients[sdfg.cfg_id] = sdfg.shared_transients(check_toplevel=False, include_nested_data=True)
             fsyms[sdfg.cfg_id] = self.symbols_and_constants(sdfg)
+            # Scope allocation asks whether a name appears in any control
+            # expression. Derive that fixed set once, rather than rescanning
+            # every region/edge separately for every transient descriptor.
+            reads = set()
+            for edge in sdfg.all_interstate_edges():
+                reads.update(self.free_symbols(edge.data))
+            for region in sdfg.all_control_flow_regions():
+                reads.update(region.used_symbols(all_symbols=True, with_contents=False))
+            control_reads[sdfg.cfg_id] = reads
 
             #############################################
             # Look for all states in which a scope-allocated array is used in
@@ -760,13 +770,7 @@ DACE_EXPORTED void __dace_set_external_memory_{storage.name}({mangle_dace_state_
                 multistate = False
 
                 # Does the array appear in inter-state edges or loop / conditional block conditions etc.?
-                for isedge in sdfg.all_interstate_edges():
-                    if name in self.free_symbols(isedge.data):
-                        multistate = True
-                for cfg in sdfg.all_control_flow_regions():
-                    block_syms = cfg.used_symbols(all_symbols=True, with_contents=False)
-                    if name in block_syms:
-                        multistate = True
+                multistate = name in control_reads[sdfg.cfg_id]
 
                 code_users = code_instances[sdfg.cfg_id].get(name, [])
                 for state in sdfg.states():
