@@ -1076,6 +1076,11 @@ DACE_EXPORTED void __dace_set_external_memory_{storage.name}({mangle_dace_state_
             # as part of the function's arguments
             if not is_top_level and isvarName in sdfg.parent_nsdfg_node.symbol_mapping:
                 continue
+            # A scalar data container can also be assigned on an interstate
+            # edge. Its outer allocation already declared the same local.
+            if (isinstance(sdfg.arrays.get(isvarName), data.Scalar)
+                    and self.dispatcher.defined_vars.has(isvarName)):
+                continue
             if isvarName not in outside_symbols:
                 edge_codegen.emit_interstate_variable_declaration(isvarName, isvarType, callsite_stream, sdfg)
             # If the variable is passed as an input argument to the SDFG, do not need to declare it
