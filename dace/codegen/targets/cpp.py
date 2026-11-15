@@ -830,6 +830,23 @@ def connected_to_gpu_memory(node: nodes.Node, state: SDFGState, sdfg: SDFG):
     return False
 
 
+def _descriptor_symbol_types(sdfg, codegen):
+    """Snapshot finalized descriptor types once per graph/codegen context.
+
+    Tasklet emission changes local scopes, but not descriptor expressions.
+    Rebuild if codegen adds a descriptor; every new codegen context starts fresh.
+    """
+    cache = getattr(codegen, '_descriptor_symbol_types_cache', None)
+    if cache is None:
+        cache = codegen._descriptor_symbol_types_cache = {}
+    key = id(sdfg)
+    entry = cache.get(key)
+    if entry is None or entry[0] != len(sdfg.arrays):
+        types = {str(symbol):symbol.dtype for desc in sdfg.arrays.values() for symbol in desc.free_symbols}
+        entry = cache[key] = (len(sdfg.arrays),types)
+    return entry[1]
+
+
 def unparse_tasklet(sdfg, cfg, state_id, dfg, node, function_stream, callsite_stream, locals, ldepth, toplevel_schedule,
                     codegen):
 
@@ -961,7 +978,7 @@ def unparse_tasklet(sdfg, cfg, state_id, dfg, node, function_stream, callsite_st
             memlets[vconn] = (memlet, False, None, conntype)
 
     # To prevent variables-redefinition, build dictionary with all the previously defined symbols
-    defined_symbols = state_dfg.symbols_defined_at(node)
+    defined_symbols = state_dfg.symbols_defined_at(node, _descriptor_symbol_types(sdfg, codegen))
 
     constants = sdfg.constants
     defined_symbols.update({

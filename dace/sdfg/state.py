@@ -1649,7 +1649,8 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
                     pass
         return result
 
-    def symbols_defined_at(self, node: nd.Node) -> Dict[str, dtypes.typeclass]:
+    def symbols_defined_at(self, node: nd.Node,
+                           descriptor_symbols: Optional[Dict[str, dtypes.typeclass]] = None) -> Dict[str, dtypes.typeclass]:
         """
         Returns all symbols available to a given node.
         The symbols a node can access are a combination of the global SDFG
@@ -1657,6 +1658,8 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
         and symbols defined in scope entries in the path to this node.
 
         :param node: The given node.
+        :param descriptor_symbols: Optional snapshot of descriptor symbol types, for
+                                   callers working on finalized descriptors.
         :return: A dictionary mapping symbol names to their types.
         """
         from dace.sdfg.sdfg import SDFG
@@ -1668,8 +1671,11 @@ class SDFGState(OrderedMultiDiConnectorGraph[nd.Node, mm.Memlet], ControlFlowBlo
 
         # Start with global symbols
         symbols = collections.OrderedDict(sdfg.symbols)
-        for desc in sdfg.arrays.values():
-            symbols.update([(str(s), s.dtype) for s in desc.free_symbols])
+        if descriptor_symbols is None:
+            for desc in sdfg.arrays.values():
+                symbols.update([(str(s), s.dtype) for s in desc.free_symbols])
+        else:
+            symbols.update(descriptor_symbols)
 
         # Add symbols from inter-state edges along the path to the state
         try:
