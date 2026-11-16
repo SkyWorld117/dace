@@ -354,9 +354,9 @@ class LoopToMap(xf.MultiStateTransformation):
             if [n for n in loop_state.data_nodes() if isinstance(n.desc(sdfg), dt.StructureView)]:
                 return False
 
-        # At most one iteration cannot carry a dependence; a clamped bound only confuses.
-        if loop_analysis.loop_provably_at_most_one_iteration(self.loop):
-            return True
+        # A single iteration can still assign a symbol read after the loop.
+        # Mapping it would move that assignment into a by-value nested call,
+        # so even trivial ranges must pass the symbol-liveness checks below.
 
         symbols_that_may_be_used: OrderedSet[str] = OrderedSet([itervar])
         used_before_assignment: OrderedSet[str] = OrderedSet()

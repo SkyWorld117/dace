@@ -647,6 +647,31 @@ namespace dace
             return result;
         }
 
+        // Fortran REAL ** runtime INTEGER keeps the base kind at every product.
+        // A generic std::pow(float, int64_t) promotes the expression to double.
+        // The low-bit-first product order matches GCC's variable powers;
+        // literal powers retain their separate compiler-specialized lowering.
+        template<typename T, typename I>
+        DACE_HDFI T fortran_ipow(T base, I exponent) {
+            using U = typename std::make_unsigned<I>::type;
+            U power = static_cast<U>(exponent);
+            if constexpr (std::is_signed<I>::value) {
+                if (exponent < 0) {
+                    power = U(0) - power;
+                }
+            }
+            T result = T(1);
+            while (power != 0) {
+                if (power & U(1)) result *= base;
+                power >>= 1;
+                if (power != 0) base *= base;
+            }
+            if constexpr (std::is_signed<I>::value) {
+                if (exponent < 0) return T(1) / result;
+            }
+            return result;
+        }
+
         // Balance small compile-time powers instead of appending a multiply
         // after squaring. For x**5, (x*x)*(x*(x*x)) retains the rounding of
         // native Fortran constant-power lowering; ((x*x)*(x*x))*x can differ.
