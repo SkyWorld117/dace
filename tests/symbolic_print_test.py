@@ -84,3 +84,16 @@ def test_max_int_literal_stays_int():
     # This one SHOULD have bare 0, not 0.0
     clean = result.replace(" ", "")
     assert "0.0" not in clean, f"Integer literal 0 was promoted to float: '{result}'"
+
+
+def test_sqrt_cpp_prints_sqrt_not_integer_half():
+    """sympy.Half prints as '1/2'; generated C++ must use sqrt, not pow(x, 1/2)."""
+    x = sympy.Symbol('x')
+    assert symstr(sympy.sqrt(x), cpp_mode=True) == '(dace::math::sqrt(x))'
+    assert symstr(x**sympy.Rational(1, 2), cpp_mode=True) == '(dace::math::sqrt(x))'
+
+
+def test_integer_powers_unchanged():
+    x = sympy.Symbol('x')
+    assert symstr(x**2, cpp_mode=True) == '((x) * (x))'
+    assert symstr(x**0, cpp_mode=True) == '1'

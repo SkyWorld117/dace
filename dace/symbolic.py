@@ -2724,20 +2724,20 @@ class DaceSympyPrinter(sympy.printing.str.StrPrinter):
         return super()._print_Symbol(expr)
 
     def _print_Pow(self, expr):
-        base = self._print(expr.args[0])
-        exponent = self._print(expr.args[1])
+        base_expr, exponent_expr = expr.args
+        base = self._print(base_expr)
+        exponent = self._print(exponent_expr)
 
-        # Special case for square root
-        if self.cpp_mode:
-            try:
-                if float(exponent) == 0.5:
-                    return f'dace::math::sqrt({base})'
-            except ValueError:
-                pass
+        # Special case for square root.  Inspect the sympy exponent, not its
+        # printed form: sympy.Half prints as "1/2", which float()/int() reject
+        # and which previously fell through to ``pow(x, 1/2)`` (integer
+        # division, i.e. ``pow(x, 0) == 1``) in generated C++.
+        if self.cpp_mode and exponent_expr == sympy.Rational(1, 2):
+            return f'dace::math::sqrt({base})'
 
         # Special case for integer powers
-        try:
-            int_exp = int(exponent)
+        if exponent_expr.is_Integer:
+            int_exp = int(exponent_expr)
             if int_exp == 0:
                 return '1'
             negative = int_exp < 0
@@ -2750,11 +2750,9 @@ class DaceSympyPrinter(sympy.printing.str.StrPrinter):
             if negative:
                 res = f'reciprocal({res})'
             return res
-        except ValueError:
-            if self.cpp_mode:
-                return "dace::math::pow({f}, {s})".format(f=self._print(expr.args[0]), s=self._print(expr.args[1]))
-            else:
-                return f'({self._print(expr.args[0])}) ** ({self._print(expr.args[1])})'
+        if self.cpp_mode:
+            return "dace::math::pow({f}, {s})".format(f=base, s=exponent)
+        return f'({base}) ** ({exponent})'
 
 
 @lru_cache(maxsize=16384, typed=True)
